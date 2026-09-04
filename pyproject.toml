@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "esp-idf-mcp"
+version = "0.1.0"
+description = "MCP server that lets AI agents build, flash, and monitor ESP-IDF projects on real hardware"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Maty403" }]
+keywords = ["esp-idf", "esp32", "mcp", "model-context-protocol", "esptool", "ai-agent", "embedded"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Embedded Systems",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "pyserial>=3.5",
+]
+
+[project.scripts]
+esp-idf-mcp = "esp_idf_mcp:main"
+
+[tool.setuptools]
+py-modules = ["esp_idf_mcp"]
