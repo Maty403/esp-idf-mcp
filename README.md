@@ -8,7 +8,7 @@ Instead of an agent only being able to *write* firmware code, this server closes
 ## Features
 
 - **Zero-config ESP-IDF discovery** — IDF root, tools directory and the Python venv are located automatically (env var first, else the newest install under `D:\esp`, `C:\esp` or `~/esp`); toolchain paths are matched by version glob, so upgrading ESP-IDF or a toolchain never requires editing the script.
-- **Builds through `idf.py build`** — the exact same path as a manual build, so hand-edited `sdkconfig` values are picked up through the official ninja RERUN_CMAKE flow instead of being silently reverted by a kconfgen rewrite. `sdkconfig.defaults*` changes (an upstream blind spot — ninja never notices them) are detected with a stateless mtime check against `build/build.ninja` and automatically chained with `idf.py reconfigure`, so defaults edits take effect on the next build with zero extra cost when nothing changed.
+- **Builds through `idf.py build`** — the exact same path as a manual build, so hand-edited `sdkconfig` values are picked up through the official ninja RERUN_CMAKE flow instead of being silently reverted by a kconfgen rewrite. `sdkconfig.defaults*` entries (an upstream blind spot — ninja never notices them, and kconfgen lets stale `sdkconfig` entries win) are merged into `sdkconfig` in place before every build: values overridden, missing lines appended, nothing else touched, no file deleted. Remove an option from the defaults files to stop pinning it.
 - **Flash + auto-monitor in one call** — flashes with `esptool` (reads `build/flash_args`), waits out the hard-reset boot, then opens a persistent monitor session on that port (the board is reset, so the session only holds the fresh boot log) and returns immediately — poll it with `monitor_read`. The target port is the one you pass in (auto-detected as the first non-COM1 port when omitted), and only that port's monitor session is closed before flashing (skipped when none is open) — other boards are never disturbed.
 - **Chip info from real hardware** — `read_chip_info` reports chip model, revision, features, crystal, MAC address, and flash vendor/device/size via esptool, then hard-resets the board back into the running app.
 - **Baud auto-detected** — every serial capture reads `CONFIG_ESP_CONSOLE_UART_BAUDRATE` from the project `sdkconfig` (no hardcoded default), so logs are never garbled.
@@ -23,7 +23,7 @@ Includes a Windows `usbser.sys` workaround (RTS-only control transfers need a DT
 
 | Tool | Purpose |
 | --- | --- |
-| `build_project` | `idf.py build` (auto-reconfigures when `sdkconfig.defaults*` changed since the last configure) |
+| `build_project` | `idf.py build` (applies `sdkconfig.defaults*` overrides to `sdkconfig` in place before building) |
 | `flash_project` | esptool flash (target port auto-detected as the first non-COM1 port when omitted); closes only that port's monitor session before flashing, then opens a persistent monitor session on it (baud from `sdkconfig`) for `monitor_read` |
 | `read_chip_info` | Chip model, revision, features, crystal, MAC, flash vendor/device/size |
 | `set_target` | `idf.py set-target` (esp32, esp32s3, esp32c2, …) |
