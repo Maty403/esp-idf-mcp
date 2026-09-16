@@ -17,33 +17,84 @@ try:
 except ImportError:
     list_ports = None
 
-# Set up environment. Everything can be overridden from outside, e.g.:
-#   set IDF_PATH=D:\esp\esp-idf
-#   set IDF_PYTHON_ENV_PATH=C:\Espressif\tools\python_env\idf5.5_py3.11_env
-# Defaults below match a standard Windows ESP-IDF installation — adjust via
-# env vars if your layout differs (Linux/macOS users will want to set these).
-os.environ.setdefault('PYTHON_DEPS_CHECKED', '1')
-os.environ.setdefault('IDF_PATH', r'C:\esp\v6.0.2\esp-idf')
-os.environ.setdefault('IDF_PYTHON_ENV_PATH', r'C:\Espressif\tools\python\v6.0.2\venv')
-os.environ.setdefault('ESP_IDF_VERSION', '6.0.2')
+# === ESP-IDF 自动定位：环境变量优先，否则扫描常见安装位置取最新版 ===
+import glob as _glob
+
+
+def _newest(pattern):
+    """Newest matching dir for a wildcard path pattern (None if no match)."""
+    matches = sorted(m for m in _glob.glob(pattern) if os.path.isdir(m))
+    return matches[-1] if matches else None
+
+
+def _find_idf_path():
+    """env IDF_PATH -> newest */esp-idf under common install roots."""
+    env = os.environ.get('IDF_PATH')
+    if env and os.path.isfile(os.path.join(env, 'tools', 'idf.py')):
+        return env
+    for base in (r'D:\esp', r'C:\esp', os.path.join(os.path.expanduser('~'), 'esp')):
+        if not os.path.isdir(base):
+            continue
+        found = [os.path.join(base, v, 'esp-idf') for v in os.listdir(base)
+                 if os.path.isfile(os.path.join(base, v, 'esp-idf', 'tools', 'idf.py'))]
+        if found:
+            return sorted(found)[-1]  # 取版本号最大的
+    raise SystemExit('ESP-IDF not found: set IDF_PATH, or install under D:\\esp\\<ver>\\esp-idf')
+
+
+def _find_tools_dir():
+    """env IDF_TOOLS_PATH -> classic installer locations."""
+    env = os.environ.get('IDF_TOOLS_PATH')
+    if env and os.path.isdir(env):
+        return env
+    for cand in (r'C:\Espressif\tools', r'D:\espressif\tools'):
+        if os.path.isdir(cand):
+            return cand
+    raise SystemExit('Espressif tools dir not found: set IDF_TOOLS_PATH')
+
+
+os.environ['PYTHON_DEPS_CHECKED'] = '1'
+IDF_PATH = _find_idf_path()
+os.environ['IDF_PATH'] = IDF_PATH
+# 目录名形如 'v6.1'，但 idf_component_manager 用 Version.coerce 解析该变量，
+# 前导 'v' 会抛 "Version string lacks a numerical component"，导致
+# clean_project / set_target / add_dependency（走 idf.py 的工具）全部失败。
+# 因此这里去掉前导 v：'v6.1' -> '6.1'
+os.environ['ESP_IDF_VERSION'] = os.path.basename(os.path.dirname(IDF_PATH)).lstrip('vV')
 # 启用 Component Manager：允许 idf.py add-dependency / build 解析并拉取组件
 # (如 esp-nn, esp-tflite-micro)。默认关闭会导致组件依赖无法解析。
-os.environ.setdefault('IDF_COMPONENT_MANAGER', '1')
+os.environ['IDF_COMPONENT_MANAGER'] = '1'
 
-# Add toolchain paths to PATH (missing entries are skipped so the script
-# still works when only IDF_PATH / the Python env are present)
-_tools = r'C:\Espressif\tools'
+_tools = _find_tools_dir()
+os.environ['IDF_TOOLS_PATH'] = _tools
+# IDF python venv：env 优先，否则 tools 下取最新（安装器随 IDF 版本生成）
+_python_env = os.environ.get('IDF_PYTHON_ENV_PATH') or _newest(os.path.join(_tools, 'python', '*', 'venv'))
+if not _python_env or not os.path.isdir(_python_env):
+    raise SystemExit('IDF python venv not found: set IDF_PYTHON_ENV_PATH')
+os.environ['IDF_PYTHON_ENV_PATH'] = _python_env
+IDF_PYTHON = os.path.join(_python_env, 'Scripts', 'python.exe')  # 子进程统一用它（esptool/idf.py/pytest）
+
+# 工具链版本号通配匹配（升级 IDF/工具链无需改代码），注入 PATH
 _extra_paths = [
-    os.path.join(_tools, 'xtensa-esp-elf', 'esp-15.2.0_20251204', 'xtensa-esp-elf', 'bin'),
-    os.path.join(_tools, 'riscv32-esp-elf', 'esp-15.2.0_20251204', 'riscv32-esp-elf', 'bin'),
-    os.path.join(_tools, 'esp32ulp-elf', '2.38_20240113', 'esp32ulp-elf', 'bin'),
-    os.path.join(_tools, 'cmake', '4.0.3', 'bin'),
-    os.path.join(_tools, 'ninja', '1.12.1'),
-    os.path.join(_tools, 'idf-exe', '1.0.3'),
-    os.path.join(os.environ['IDF_PATH'], 'tools'),
-    os.path.join(os.environ['IDF_PYTHON_ENV_PATH'], 'Scripts'),
+    _newest(os.path.join(_tools, 'xtensa-esp-elf', '*', 'xtensa-esp-elf', 'bin')),
+    _newest(os.path.join(_tools, 'riscv32-esp-elf', '*', 'riscv32-esp-elf', 'bin')),
+    _newest(os.path.join(_tools, 'esp32ulp-elf', '*', 'esp32ulp-elf', 'bin')),
+    _newest(os.path.join(_tools, 'cmake', '*', 'bin')),
+    _newest(os.path.join(_tools, 'ninja', '*')),
+    _newest(os.path.join(_tools, 'idf-exe', '*')),
+    # ninja 用 ccache 当编译器启动器时需要能找到它，否则报
+    # "CreateProcess failed: The system cannot find the file specified"
+    _newest(os.path.join(_tools, 'ccache', '*')),
+    os.path.join(IDF_PATH, 'tools'),
+    os.path.join(_python_env, 'Scripts'),
 ]
-os.environ['PATH'] = os.pathsep.join(p for p in _extra_paths if os.path.isdir(p)) + os.pathsep + os.environ.get('PATH', '')
+
+# 生成 esp_rom gdbinit 需要该变量，缺失时 project.cmake 会打 CMake Warning
+_rom_elfs = _newest(os.path.join(_tools, 'esp-rom-elfs', '*'))
+if _rom_elfs and not os.environ.get('ESP_ROM_ELF_DIR'):
+    os.environ['ESP_ROM_ELF_DIR'] = _rom_elfs
+os.environ['PATH'] = os.pathsep.join(p for p in _extra_paths if p) + os.pathsep + os.environ.get('PATH', '')
+print(f'[esp-idf-mcp] IDF_PATH={IDF_PATH}  TOOLS={_tools}  PYENV={_python_env}', file=sys.stderr)
 
 from mcp.server.fastmcp import FastMCP
 
@@ -99,27 +150,25 @@ def build_project(project_dir: str, full_log: bool = False) -> str:
 
 
 @mcp.tool(structured_output=False)
-def flash_project(project_dir: str, port: Optional[str] = None, monitor_baud: int = 0, monitor_timeout: int = 5, wait_after_flash: float = 2.0, collect_window: int = 10, wait_for: str = '', max_wait: int = 30) -> str:
-    """Flash the built project using esptool directly. Optionally auto-starts serial monitor after flash.
+def flash_project(project_dir: str, port: Optional[str] = None, monitor: bool = True, wait_after_flash: float = 2.0) -> str:
+    """Flash the built project using esptool directly. Optionally opens a persistent monitor session after flash (poll it with monitor_read).
+    Monitor sessions on the target port are closed automatically before flashing (no manual monitor_close needed).
     Args:
         project_dir: Absolute path to the ESP-IDF project directory
-        port: Serial port (e.g. COM13). Auto-detected if not specified.
-        monitor_baud: If > 0, auto-start serial monitor after flash at this baud rate (default 0 = no monitor).
-        monitor_timeout: Seconds to wait for first serial data before returning (default 5).
-        wait_after_flash: Seconds to wait after flash before opening serial (default 2.0). Lets esptool's hard-reset boot finish, avoiding stale logs in USB buffer.
-        collect_window: Seconds to keep collecting after first data arrives when wait_for is empty (default 10, covers most app startup sequences).
-        wait_for: If set (regex), keep collecting until a line matches this pattern, then return early (~1s settle). E.g. 'error|panic|Guru Meditation', 'ip_ready'.
-        max_wait: Max total seconds to keep collecting while waiting for wait_for to match (default 30).
+        port: Serial port (e.g. COM13). When omitted, the first non-COM1 port is auto-detected and used. Only monitor sessions on this port are closed before flashing (skip if none open).
+        monitor: Open a persistent monitor session after flashing (default True) so the boot log can be polled with monitor_read. Baud auto-detected from sdkconfig; set False to skip.
+        wait_after_flash: Seconds to wait after flash before opening the monitor (default 2.0). Lets esptool's hard-reset boot finish, avoiding stale logs in the USB buffer.
     """
-    # esptool 独占串口：先关掉占用目标口（或全部，自动找口时）的监视会话，否则烧录必失败
+    # 烧录前准备：无 port 时先自动检测；确定具体串口后只关闭这个口的监视会话（没开着就跳过）
+    if not port:
+        port = _autodetect_port()
+        if not port:
+            return 'No serial port found (COM1 excluded) — pass port explicitly.'
     closed = _close_monitors_on_port(port)
     closed_note = f' (auto-closed monitor: {", ".join(closed)})' if closed else ''
     build_dir = os.path.join(project_dir, 'build')
     flash_args_file = os.path.join(build_dir, 'flash_args')
-    cmd = [sys.executable, '-m', 'esptool']
-    if port:
-        cmd.extend(['--port', port])
-    cmd.extend(['--before', 'default-reset', '--after', 'hard-reset'])
+    cmd = [IDF_PYTHON, '-m', 'esptool', '--port', port, '--before', 'default-reset', '--after', 'hard-reset']
     cmd.append('write-flash')
     if os.path.exists(flash_args_file):
         with open(flash_args_file, 'r') as f:
@@ -128,13 +177,98 @@ def flash_project(project_dir: str, port: Optional[str] = None, monitor_baud: in
     rc, out = _run_sync(cmd, build_dir)
     if rc != 0:
         return f'Flash failed (exit {rc}): {out[-500:]}'
-    result = f'Successfully flashed{" to " + port if port else ""}.{closed_note} {out[-200:]}'
-    # 烧录后自动开串口：等待 esptool 硬复位后的启动跑完，再打开串口+主动复位，避免 USB 缓冲区残留旧日志
-    if monitor_baud > 0 and port:
+    result = f'Successfully flashed to {port}.{closed_note} {out[-200:]}'
+    # 烧录后开一个常驻监视会话（reset=True：板子被复位，会话里只有本次启动的新日志），
+    # 立即返回，由 agent 之后用 monitor_read 轮询；不用了用 monitor_close 释放。
+    if monitor:
         if wait_after_flash > 0:
             time.sleep(wait_after_flash)
-        result += '\n' + serial_start(port, baud=monitor_baud, reset=True, duration=monitor_timeout, collect_window=collect_window, wait_for=wait_for, max_wait=max_wait)
+        result += '\n' + monitor_open(port, reset=True, project_dir=project_dir)
     return result
+
+# 在 venv python 子进程里执行的读芯片信息脚本（esptool 日志走 stdout，
+# 只能放子进程，否则会污染 MCP 的 stdio JSON-RPC 通道）
+_CHIP_INFO_SNIPPET = r'''
+import json, sys
+
+port, baud = sys.argv[1], int(sys.argv[2])
+info = {}
+try:
+    from esptool.cmds import detect_chip, detect_flash_size
+    esp = detect_chip(port=port, baud=baud)
+    info['chip'] = esp.CHIP_NAME
+    try:
+        rev = esp.get_chip_revision()
+        info['chip_revision'] = f'v{rev // 100}.{rev % 100} (raw {rev})'
+    except Exception as e:
+        info['chip_revision_error'] = str(e)
+    try:
+        info['features'] = esp.get_chip_features()
+    except Exception as e:
+        info['features_error'] = str(e)
+    try:
+        info['crystal_freq_mhz'] = esp.get_crystal_freq()
+    except Exception as e:
+        info['crystal_freq_error'] = str(e)
+    try:
+        info['mac'] = ':'.join(f'{b:02x}' for b in esp.read_mac())
+    except Exception as e:
+        info['mac_error'] = str(e)
+    try:
+        fid = esp.flash_id()
+        info['flash_vendor_id'] = f'0x{fid & 0xFF:02x}'
+        info['flash_device_id'] = f'0x{(fid >> 8) & 0xFFFF:04x}'
+        # esptool 5.x 的 detect_flash_size 返回 '4MB' 这类字符串（或 None）
+        info['flash_size'] = detect_flash_size(esp)
+    except Exception as e:
+        info['flash_error'] = str(e)
+    try:
+        esp.hard_reset()  # 读完硬复位，让应用恢复运行
+    except Exception:
+        pass
+except Exception as e:
+    info['error'] = f'{type(e).__name__}: {e}'
+finally:
+    print(json.dumps(info))
+    sys.exit(0 if 'error' not in info else 1)
+'''
+
+
+@mcp.tool(structured_output=False)
+def read_chip_info(port: str = '', baud: int = 115200) -> str:
+    """Read hardware info from a connected ESP32 board via esptool: chip model, revision, features, crystal freq, MAC address, flash vendor/device/size. The board is briefly put into download mode and hard-reset back to the running app afterwards. Note: PSRAM info is NOT available here (read it from the boot log via monitor_open + monitor_read).
+    Args:
+        port: Serial port (e.g. COM13). Empty = auto-detect (first port, excluding COM1).
+        baud: Baud rate for the esptool connection (default 115200).
+    """
+    if not port:
+        port = _autodetect_port()
+        if not port:
+            return 'No serial port found (COM1 excluded).'
+    closed = _close_monitors_on_port(port)
+    closed_note = f' (auto-closed monitor: {", ".join(closed)})' if closed else ''
+    rc, out = _run_sync([IDF_PYTHON, '-c', _CHIP_INFO_SNIPPET, port, str(baud)], tempfile.gettempdir(), timeout=120)
+    # 输出里混有 esptool 的连接日志，取最后一行 JSON
+    json_line = next((l for l in reversed(out.strip().splitlines()) if l.startswith('{')), None)
+    if json_line is None:
+        return f'Failed to read chip info on {port} (exit {rc}):{closed_note}{os.linesep}{out[-500:]}'
+    info = json.loads(json_line)
+    if 'error' in info:
+        return f'Failed to read chip info on {port}:{closed_note}{os.linesep}{info["error"]}'
+    lines = [f'Chip info for {port}{closed_note}:',
+             f'  chip:         {info.get("chip", "?")}']
+    for key, label in [('chip_revision', 'revision:     '), ('features', 'features:     '),
+                       ('crystal_freq_mhz', 'crystal:      '), ('mac', 'MAC:          '),
+                       ('flash_vendor_id', 'flash vendor: '), ('flash_device_id', 'flash device: '),
+                       ('flash_size', 'flash size:   ')]:
+        if key in info:
+            lines.append(f'  {label}{info[key]}')
+    for key, label in [('chip_revision_error', 'revision'), ('features_error', 'features'),
+                       ('crystal_freq_error', 'crystal'), ('mac_error', 'MAC'), ('flash_error', 'flash')]:
+        if key in info:
+            lines.append(f'  {label}: unavailable ({info[key]})')
+    return os.linesep.join(lines)
+
 
 @mcp.tool(structured_output=False)
 def set_target(project_dir: str, target: str) -> str:
@@ -143,7 +277,7 @@ def set_target(project_dir: str, target: str) -> str:
         project_dir: Absolute path to the ESP-IDF project directory
         target: Target chip (e.g. esp32, esp32s3, esp32c2)
     """
-    cmd = [sys.executable, _get_idf_py(), 'set-target', target]
+    cmd = [IDF_PYTHON, _get_idf_py(), 'set-target', target]
     rc, out = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
         return f'Target set to: {target}'
@@ -160,7 +294,7 @@ def add_dependency(project_dir: str, dependency: str, component: str = 'main', p
         component: Name of the component in the project whose manifest gets the dependency (default 'main').
         path: Path to the component directory whose manifest gets the dependency. Takes precedence over `component` if set (official --path option).
     """
-    cmd = [sys.executable, _get_idf_py(), 'add-dependency', dependency]
+    cmd = [IDF_PYTHON, _get_idf_py(), 'add-dependency', dependency]
     if path:
         cmd.extend(['--path', path])
     elif component != 'main':
@@ -179,7 +313,7 @@ def remove_dependency(project_dir: str, dependency: str) -> str:
         project_dir: Absolute path to the ESP-IDF project directory
         dependency: Component dependency name (e.g. 'espressif/button', 'button')
     """
-    cmd = [sys.executable, _get_idf_py(), 'remove-dependency', dependency]
+    cmd = [IDF_PYTHON, _get_idf_py(), 'remove-dependency', dependency]
     rc, out = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
         return f'Dependency removed from manifests: {dependency} (pruned on next build)'
@@ -195,7 +329,7 @@ def clean_project(project_dir: str, full: bool = False) -> str:
         full: If True, remove entire build directory (fullclean). If False, incremental clean.
     """
     action = 'fullclean' if full else 'clean'
-    cmd = [sys.executable, _get_idf_py(), action]
+    cmd = [IDF_PYTHON, _get_idf_py(), action]
     rc, out = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
         return f'Project {action} successfully'
@@ -354,15 +488,34 @@ class SerialSession:
             self.thread.join(timeout=2)
 
 
+def _resolve_console_baud(project_dir: Optional[str] = None) -> int:
+    """自动检测 ESP-IDF console 波特率：仅读取工程 sdkconfig 的 CONFIG_ESP_CONSOLE_UART_BAUDRATE，无硬编码默认值。"""
+    if not project_dir:
+        raise ValueError('未传入 project_dir，无法自动检测波特率，请传入 ESP-IDF 工程目录')
+    with open(os.path.join(project_dir, 'sdkconfig'), encoding='utf-8', errors='replace') as f:
+        for line in f:
+            if line.startswith('CONFIG_ESP_CONSOLE_UART_BAUDRATE='):
+                return int(line.split('=', 1)[1].strip().strip('"'))
+    raise ValueError(f'sdkconfig 中未找到 CONFIG_ESP_CONSOLE_UART_BAUDRATE（{project_dir}）')
+
+
 # 会话式串口监视器注册表：session_id -> SerialSession（monitor_open/close 维护）
 _MONITORS: dict = {}
 
 
+def _autodetect_port() -> Optional[str]:
+    """First serial port, excluding COM1 (motherboard port). None when nothing is connected.
+    Used by flashing (and chip-info) when no port is passed: auto-detect, then close that one port only."""
+    ports = [p.device.strip() for p in list_ports.comports()] if list_ports else []
+    ports = [p for p in ports if p.upper() != 'COM1']
+    return ports[0] if ports else None
+
+
 def _close_monitors_on_port(port):
-    """Close open monitor sessions. Closes all when port is None (esptool auto-detect needs free ports)."""
+    """Close open monitor sessions on the given port (exact match, no blanket close)."""
     closed = []
     for sid, sess in list(_MONITORS.items()):
-        if port is None or sess.port == port:
+        if sess.port == port:
             sess.stop()
             _MONITORS.pop(sid, None)
             closed.append(sid)
@@ -370,13 +523,17 @@ def _close_monitors_on_port(port):
 
 
 @mcp.tool(structured_output=False)
-def monitor_open(port: str, baud: int = 74880, reset: bool = True) -> str:
+def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = None) -> str:
     """Open a persistent serial monitor session. Returns immediately (non-blocking); poll output with monitor_read.
     Args:
         port: Serial port (e.g. COM14)
-        baud: Baud rate (default 74880, works for both C2 ROM and S2 CDC)
         reset: Reset the board after opening (default True) so you capture a fresh boot
+        project_dir: Optional project dir to auto-detect console baud from sdkconfig (no default; required for baud detection)
     """
+    try:
+        baud = _resolve_console_baud(project_dir)
+    except ValueError as e:
+        return f'无法自动检测波特率：{e}'
     sid = f'{port}@{baud}'
     if sid in _MONITORS:
         return f'Session {sid} is already open — use monitor_read / monitor_send / monitor_close.'
@@ -388,12 +545,14 @@ def monitor_open(port: str, baud: int = 74880, reset: bool = True) -> str:
     _MONITORS[sid] = sess
     return (f'Monitor opened: {sid} (reset={"on" if reset else "off"}). '
             f'Poll with monitor_read, send input with monitor_send, release with monitor_close. '
-            f'Note: close this session before flashing {port}.')
+            f'Note: flashing closes existing sessions on the target port before writing, then opens a fresh one; '
+            f'read_chip_info auto-closes sessions on the target port; '
+            f'monitor_close(session_id) releases a specific session / port.')
 
 
 @mcp.tool(structured_output=False)
 def monitor_read(session_id: str, wait_for: str = '', timeout: float = 3.0, max_lines: int = 200, compact: bool = True) -> str:
-    """Read new serial output of an open session since the last read. Instant return when no wait_for; use this instead of blocking serial_start when you want to stay responsive.
+    """Read new serial output of an open session since the last read. Instant return when no wait_for; set wait_for to block until a line matches (e.g. boot ready / panic) instead of sleeping.
     Args:
         session_id: Session id from monitor_open (e.g. 'COM14@74880')
         wait_for: Optional regex; keep polling up to `timeout` seconds until a new line matches, then return early (~instant on hit)
@@ -452,70 +611,19 @@ def monitor_send(session_id: str, data: str, press_enter: bool = True) -> str:
 
 @mcp.tool(structured_output=False)
 def monitor_close(session_id: str) -> str:
-    """Close a monitor session and release the serial port (needed before flashing that port).
+    """Close a monitor session and release its serial port. Only the given session / port is released — there is no release-all mode.
     Args:
-        session_id: Session id from monitor_open
+        session_id: Session id from monitor_open (e.g. 'COM14@74880'), or a bare port ('COM14') to close all sessions on that port.
     """
-    sess = _MONITORS.pop(session_id, None)
-    if not sess:
-        return f'No session {session_id} (open sessions: {list(_MONITORS) or "none"}).'
-    sess.stop()
-    return f'Monitor closed: {session_id}. Port {sess.port} released.'
-
-
-@mcp.tool(structured_output=False)
-def serial_start(port: str, baud: int = 74880, reset: bool = True, duration: int = 5, collect_window: int = 10, wait_for: str = '', max_wait: int = 30, compact: bool = True) -> str:
-    """One-shot serial log capture: open port, reset board, wait for first data, collect logs, auto-close, return them.
-    Args:
-        port: Serial port (e.g. COM14)
-        baud: Baud rate (default 74880, works for both C2 ROM and S2 CDC)
-        reset: Reset board after opening port (default True)
-        duration: Max seconds to wait for first data before giving up (default 5)
-        collect_window: Seconds to keep collecting after first data arrives when wait_for is empty (default 10, covers most app startup sequences).
-        wait_for: If set (regex), keep collecting until a line matches this pattern, then return early (~1s settle). E.g. 'error|panic|Guru Meditation', 'ip_ready', 'example: Example ended'.
-        max_wait: Max total seconds to keep collecting while waiting for wait_for to match (default 30).
-        compact: Collapse consecutive duplicate lines (xN) to save tokens (default True)
-    """
-    try:
-        pattern = re.compile(wait_for) if wait_for else None
-    except re.error as e:
-        return f'Invalid wait_for regex: {e}'
-    session = SerialSession(port, baud)
-    try:
-        session.start(reset=reset)
-        deadline = time.time() + duration
-        while time.time() < deadline and len(session.buffer) == 0:
-            time.sleep(0.1)
-        if len(session.buffer) == 0:
-            lines = []
-        elif pattern is None:
-            time.sleep(collect_window)  # 首数据后再收集 collect_window 秒
-            lines = list(session.buffer)
-        else:
-            # 等 wait_for 命中：命中后固定收 1 秒尾巴（错误堆栈常跟在触发行后面），超时则截断
-            hard_deadline = time.time() + max_wait
-            while time.time() < hard_deadline:
-                if any(pattern.search(line) for line in session.buffer):
-                    time.sleep(1.0)
-                    break
-                time.sleep(0.2)
-            lines = list(session.buffer)
-        header = f'--- {port} @ {baud} baud ({len(lines)} lines captured) ---'
-        if pattern is not None:
-            matched = any(pattern.search(line) for line in lines)
-            header += f' [wait_for: {"MATCHED" if matched else "not matched within max_wait"}]'
-        if lines:
-            if compact:
-                lines = _collapse_dupes(lines)
-            return header + os.linesep + os.linesep.join(lines)
-        reason = f'(no data within {duration}s)' if pattern is None else f'(no data; wait_for never matched)'
-        return header + os.linesep + reason
-    except serial.SerialException as e:
-        return f'Failed to open {port}: {e}'
-    except Exception as e:
-        return f'Error: {e}'
-    finally:
-        session.stop()
+    target = session_id.strip()
+    if target in _MONITORS:
+        sess = _MONITORS.pop(target)
+        sess.stop()
+        return f'Monitor closed: {target}. Port {sess.port} released.'
+    closed = _close_monitors_on_port(target)  # 按端口名匹配（'COM14' → 'COM14@74880'）
+    if closed:
+        return f'Monitor sessions closed on {target}: {", ".join(closed)}.'
+    return f'No session {target} (open sessions: {list(_MONITORS) or "none"}).'
 
 
 @mcp.tool(structured_output=False)
@@ -530,7 +638,7 @@ def run_pytest(project_dir: str, test_path: str = 'pytest', target: str = '', po
         timeout: Max seconds for the whole test run (default 300)
         extra_args: Extra pytest CLI args, space-separated (e.g. '-k test_wifi --count=1 -vv')
     """
-    cmd = [sys.executable, '-m', 'pytest', test_path, '--embedded-services=esp,idf']
+    cmd = [IDF_PYTHON, '-m', 'pytest', test_path, '--embedded-services=esp,idf']
     if target:
         cmd.append(f'--target={target}')
     if port:
@@ -557,7 +665,7 @@ def get_connected_devices() -> str:
         return f'Error getting devices: {e}'
 
 def main():
-    """Start the MCP server with auto-restart on crash."""
+    """Start the MCP server with auto-restart on crash (also the pip console entry point)."""
     while True:
         try:
             mcp.run()
