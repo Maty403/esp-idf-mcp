@@ -19,6 +19,7 @@ except ImportError:
 
 # === ESP-IDF 自动定位：环境变量优先，否则扫描常见安装位置取最新版 ===
 import glob as _glob
+import hashlib
 
 
 def _newest(pattern):
@@ -140,36 +141,64 @@ def _run_sync(cmd, cwd, timeout=600):
         return -1, f'{e}', log_file
 
 
-def _defaults_outdated(project_dir, build_dir):
-    """sdkconfig.defaults* 不在 ninja 的重配触发列表里（官方盲区），
-    用 build.ninja 的 mtime 作为"上次 configure 时间"标记（ninja 生成器每次
-    configure 都会无条件重写它；CMakeCache.txt 在无变化时会被 cmake 跳过，不可靠）。
-    无持久状态。"""
-    marker = os.path.join(build_dir, 'build.ninja')
-    if not os.path.exists(marker):
-        return False  # 尚未配置过，idf.py build 自会完整配置
-    marker_mtime = os.path.getmtime(marker)
+def _defaults_fingerprint(project_dir):
+    """sdkconfig.defaults* 的内容指纹（文件名+内容，与 mtime 无关）；无 defaults 文件返回 None。"""
+    h = hashlib.sha1()
+    found = False
     for pattern in ('sdkconfig.defaults', 'sdkconfig.defaults.*'):
-        for f in _glob.glob(os.path.join(project_dir, pattern)):
-            if os.path.getmtime(f) > marker_mtime:
-                return True
-    return False
+        for f in sorted(_glob.glob(os.path.join(project_dir, pattern))):
+            found = True
+            h.update(os.path.basename(f).encode('utf-8'))
+            with open(f, 'rb') as fh:
+                h.update(fh.read())
+    return h.hexdigest() if found else None
 
+
+def _defaults_stale(project_dir, build_dir):
+    """defaults 内容与上次构建采用的版本是否不一致（含首次接管，以 defaults 为准）。
+    指纹快照存于 build/config/.idf_mcp_defaults_fp。返回 (是否需要重生成, 指纹)。"""
+    fp = _defaults_fingerprint(project_dir)
+    if fp is None:
+        return False, None
+    snap = os.path.join(build_dir, 'config', '.idf_mcp_defaults_fp')
+    try:
+        with open(snap, encoding='utf-8') as f:
+            if f.read().strip() == fp:
+                return False, fp
+    except OSError:
+        pass
+    return True, fp
 
 @mcp.tool(structured_output=False)
 def build_project(project_dir: str, full_log: bool = False) -> str:
-    """Build ESP-IDF project via idf.py (same as manual `idf.py build`; sdkconfig changes are auto-detected).
-    If sdkconfig.defaults* changed since the last configure, an `idf.py reconfigure` is chained before the build.
+    """Build ESP-IDF project via idf.py (same as manual `idf.py build`; hand-edited sdkconfig values are auto-detected).
+    If sdkconfig.defaults* changed since the last configure, sdkconfig is treated as stale: it is renamed to
+    sdkconfig.old and fully regenerated from the defaults (so defaults edits override previously conflicting
+    values), then `idf.py reconfigure` is chained before the build. Note: sdkconfig-only hand-edits are reset
+    at that point — mirror them into sdkconfig.defaults if you want them kept.
     Args:
         project_dir: Absolute path to the ESP-IDF project directory
         full_log: If True, return the complete build output (no truncation). If False (default), return only the tail of the output.
     """
     build_dir = os.path.join(project_dir, 'build')
     os.makedirs(build_dir, exist_ok=True)
-    actions = ['reconfigure', 'build'] if _defaults_outdated(project_dir, build_dir) else ['build']
+    note = ''
+    actions = ['build']
+    stale, fp = _defaults_stale(project_dir, build_dir)
+    if stale:
+        sdk = os.path.join(project_dir, 'sdkconfig')
+        if os.path.exists(sdk):
+            # defaults 是配置源：删除生成的 sdkconfig 全量重生成，让 defaults 对既有项的修改真正生效
+            os.replace(sdk, sdk + '.old')
+            note = ' (defaults changed: sdkconfig regenerated from defaults; previous copy kept as sdkconfig.old)'
+        actions = ['reconfigure', 'build']
     rc, out, log_file = _run_sync([IDF_PYTHON, _get_idf_py(), '-C', project_dir] + actions, project_dir)
     if rc == 0:
-        return f'Successfully built project.\n{out if full_log else out[-300:]}'
+        if fp is not None:
+            os.makedirs(os.path.join(build_dir, 'config'), exist_ok=True)
+            with open(os.path.join(build_dir, 'config', '.idf_mcp_defaults_fp'), 'w', encoding='utf-8') as f:
+                f.write(fp)
+        return f'Successfully built project.{note}\n{out if full_log else out[-300:]}'
     else:
         return f'Build failed (exit {rc}): {out if full_log else out[-500:]}{os.linesep}full log: {log_file}'
 
