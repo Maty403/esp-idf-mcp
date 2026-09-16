@@ -107,9 +107,17 @@ def _get_idf_py():
     return os.path.join(os.environ['IDF_PATH'], 'tools', 'idf.py')
 
 
+### 持久日志：每次调用独立文件，互不串扰、可事后回查；只保留最近 _LOG_KEEP 份 ###
+_LOG_DIR = os.path.join(tempfile.gettempdir(), 'esp-idf-mcp-logs')
+_LOG_KEEP = 20
+
+
 def _run_sync(cmd, cwd, timeout=600):
-    """Run command synchronously with output to file. Returns (returncode, output)."""
-    log_file = os.path.join(tempfile.gettempdir(), 'idf_mcp_output.log')
+    """Run command synchronously; output goes to a unique persistent log file.
+    Returns (returncode, output, log_file)."""
+    os.makedirs(_LOG_DIR, exist_ok=True)
+    fd, log_file = tempfile.mkstemp(prefix=time.strftime('%Y%m%d_%H%M%S_'), suffix='.log', dir=_LOG_DIR)
+    os.close(fd)
     try:
         with open(log_file, 'w', encoding='utf-8') as f:
             print(f'Running: {" ".join(cmd)} in {cwd}', file=sys.stderr)
@@ -120,11 +128,16 @@ def _run_sync(cmd, cwd, timeout=600):
             )
         with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
             output = f.read()
-        return result.returncode, output
+        for old in sorted(_glob.glob(os.path.join(_LOG_DIR, '*.log')))[:-_LOG_KEEP]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        return result.returncode, output, log_file
     except subprocess.TimeoutExpired:
-        return -1, f'Timed out after {timeout}s'
+        return -1, f'Timed out after {timeout}s', log_file
     except Exception as e:
-        return -1, str(e)
+        return -1, f'{e}', log_file
 
 
 def _defaults_outdated(project_dir, build_dir):
@@ -154,11 +167,11 @@ def build_project(project_dir: str, full_log: bool = False) -> str:
     build_dir = os.path.join(project_dir, 'build')
     os.makedirs(build_dir, exist_ok=True)
     actions = ['reconfigure', 'build'] if _defaults_outdated(project_dir, build_dir) else ['build']
-    rc, out = _run_sync([IDF_PYTHON, _get_idf_py(), '-C', project_dir] + actions, project_dir)
+    rc, out, log_file = _run_sync([IDF_PYTHON, _get_idf_py(), '-C', project_dir] + actions, project_dir)
     if rc == 0:
         return f'Successfully built project.\n{out if full_log else out[-300:]}'
     else:
-        return f'Build failed (exit {rc}): {out if full_log else out[-500:]}'
+        return f'Build failed (exit {rc}): {out if full_log else out[-500:]}{os.linesep}full log: {log_file}'
 
 
 @mcp.tool(structured_output=False)
@@ -186,9 +199,9 @@ def flash_project(project_dir: str, port: Optional[str] = None, monitor: bool = 
         with open(flash_args_file, 'r') as f:
             args = f.read().strip().split()
         cmd.extend(args)
-    rc, out = _run_sync(cmd, build_dir)
+    rc, out, log_file = _run_sync(cmd, build_dir)
     if rc != 0:
-        return f'Flash failed (exit {rc}): {out[-500:]}'
+        return f'Flash failed (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
     result = f'Successfully flashed to {port}.{closed_note} {out[-200:]}'
     # 烧录后开一个常驻监视会话（reset=True：板子被复位，会话里只有本次启动的新日志），
     # 立即返回，由 agent 之后用 monitor_read 轮询；不用了用 monitor_close 释放。
@@ -259,11 +272,11 @@ def read_chip_info(port: str = '', baud: int = 115200) -> str:
             return 'No serial port found (COM1 excluded).'
     closed = _close_monitors_on_port(port)
     closed_note = f' (auto-closed monitor: {", ".join(closed)})' if closed else ''
-    rc, out = _run_sync([IDF_PYTHON, '-c', _CHIP_INFO_SNIPPET, port, str(baud)], tempfile.gettempdir(), timeout=120)
+    rc, out, log_file = _run_sync([IDF_PYTHON, '-c', _CHIP_INFO_SNIPPET, port, str(baud)], tempfile.gettempdir(), timeout=120)
     # 输出里混有 esptool 的连接日志，取最后一行 JSON
     json_line = next((l for l in reversed(out.strip().splitlines()) if l.startswith('{')), None)
     if json_line is None:
-        return f'Failed to read chip info on {port} (exit {rc}):{closed_note}{os.linesep}{out[-500:]}'
+        return f'Failed to read chip info on {port} (exit {rc}):{closed_note}{os.linesep}{out[-500:]}{os.linesep}full log: {log_file}'
     info = json.loads(json_line)
     if 'error' in info:
         return f'Failed to read chip info on {port}:{closed_note}{os.linesep}{info["error"]}'
@@ -290,11 +303,11 @@ def set_target(project_dir: str, target: str) -> str:
         target: Target chip (e.g. esp32, esp32s3, esp32c2)
     """
     cmd = [IDF_PYTHON, _get_idf_py(), 'set-target', target]
-    rc, out = _run_sync(cmd, project_dir, timeout=120)
+    rc, out, log_file = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
         return f'Target set to: {target}'
     else:
-        return f'Failed to set target (exit {rc}): {out[-500:]}'
+        return f'Failed to set target (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
 
 
 @mcp.tool(structured_output=False)
@@ -311,11 +324,11 @@ def add_dependency(project_dir: str, dependency: str, component: str = 'main', p
         cmd.extend(['--path', path])
     elif component != 'main':
         cmd.extend(['--component', component])
-    rc, out = _run_sync(cmd, project_dir, timeout=120)
+    rc, out, log_file = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
         return f'Dependency added to manifest: {dependency} (component downloaded on next build)'
     else:
-        return f'Failed to add dependency (exit {rc}): {out[-500:]}'
+        return f'Failed to add dependency (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
 
 
 @mcp.tool(structured_output=False)
@@ -326,11 +339,11 @@ def remove_dependency(project_dir: str, dependency: str) -> str:
         dependency: Component dependency name (e.g. 'espressif/button', 'button')
     """
     cmd = [IDF_PYTHON, _get_idf_py(), 'remove-dependency', dependency]
-    rc, out = _run_sync(cmd, project_dir, timeout=120)
+    rc, out, log_file = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
         return f'Dependency removed from manifests: {dependency} (pruned on next build)'
     else:
-        return f'Failed to remove dependency (exit {rc}): {out[-500:]}'
+        return f'Failed to remove dependency (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
 
 
 @mcp.tool(structured_output=False)
@@ -342,11 +355,11 @@ def clean_project(project_dir: str, full: bool = False) -> str:
     """
     action = 'fullclean' if full else 'clean'
     cmd = [IDF_PYTHON, _get_idf_py(), action]
-    rc, out = _run_sync(cmd, project_dir, timeout=120)
+    rc, out, log_file = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
         return f'Project {action} successfully'
     else:
-        return f'Clean failed (exit {rc}): {out[-500:]}'
+        return f'Clean failed (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
 
 
 
@@ -657,11 +670,11 @@ def run_pytest(project_dir: str, test_path: str = 'pytest', target: str = '', po
         cmd.extend(['--port', port])
     if extra_args:
         cmd.extend(extra_args.split())
-    rc, out = _run_sync(cmd, project_dir, timeout=timeout)
+    rc, out, log_file = _run_sync(cmd, project_dir, timeout=timeout)
     tail = out if len(out) < 4000 else out[-4000:]
     if rc == 0:
         return f'All tests passed ({len(out)} bytes output):{os.linesep}{tail}'
-    return f'Tests failed / errored (exit {rc}):{os.linesep}{tail}'
+    return f'Tests failed / errored (exit {rc}):{os.linesep}{tail}{os.linesep}full log: {log_file}'
 
 
 # === RESOURCES ===
