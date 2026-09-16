@@ -140,13 +140,19 @@ def _run_sync(cmd, cwd, timeout=600):
         return -1, f'{e}', log_file
 
 
+# 备份文件（sdkconfig.defaults.bak/.old 等）不参与合并，避免旧配置复活
+_BACKUP_RE = re.compile(r'\.(bak|old|orig|backup)$', re.IGNORECASE)
+
+
 def _apply_defaults_overrides(project_dir):
     """把 sdkconfig.defaults* 里出现的赋值就地合并进 sdkconfig：已有行覆盖、缺失行
     追加到末尾；defaults 没提到的 sdkconfig 内容一律不动。不删除、不重命名任何文件。
-    返回是否有修改。"""
+    备份文件（.bak/.old/.orig/.backup）不参与合并。返回是否有修改。"""
     assignments = {}
     for pattern in ('sdkconfig.defaults', 'sdkconfig.defaults.*'):
         for path in sorted(_glob.glob(os.path.join(project_dir, pattern))):
+            if _BACKUP_RE.search(path):
+                continue
             with open(path, 'rb') as f:
                 for line in f.read().decode('utf-8', errors='replace').splitlines():
                     line = line.strip()
@@ -188,7 +194,8 @@ def _apply_defaults_overrides(project_dir):
 def build_project(project_dir: str, full_log: bool = False) -> str:
     """Build ESP-IDF project via idf.py (same as manual `idf.py build`).
     Before building, assignments from sdkconfig.defaults* are merged in place into
-    sdkconfig (values overridden, missing lines appended; no file is deleted and
+    sdkconfig (values overridden, missing lines appended; backup files such as
+    .bak/.old are ignored; no file is deleted and
     anything not mentioned in the defaults is never touched), so defaults edits
     take effect without manual sdkconfig surgery. Remove an option from the
     defaults files to stop pinning it.
