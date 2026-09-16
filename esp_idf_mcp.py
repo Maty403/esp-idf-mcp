@@ -84,7 +84,8 @@ _extra_paths = [
     _newest(os.path.join(_tools, 'idf-exe', '*')),
     # ninja 用 ccache 当编译器启动器时需要能找到它，否则报
     # "CreateProcess failed: The system cannot find the file specified"
-    _newest(os.path.join(_tools, 'ccache', '*')),
+    # EIM 布局多嵌一层：ccache\<ver>\ccache-<ver>-windows-x86_64\ccache.exe
+    _newest(os.path.join(_tools, 'ccache', '*', 'ccache-*')) or _newest(os.path.join(_tools, 'ccache', '*')),
     os.path.join(IDF_PATH, 'tools'),
     os.path.join(_python_env, 'Scripts'),
 ]
