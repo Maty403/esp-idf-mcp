@@ -19,7 +19,6 @@ except ImportError:
 
 # === ESP-IDF 自动定位：环境变量优先，否则扫描常见安装位置取最新版 ===
 import glob as _glob
-import hashlib
 
 
 def _newest(pattern):
@@ -141,63 +140,67 @@ def _run_sync(cmd, cwd, timeout=600):
         return -1, f'{e}', log_file
 
 
-def _defaults_fingerprint(project_dir):
-    """sdkconfig.defaults* 的内容指纹（文件名+内容，与 mtime 无关）；无 defaults 文件返回 None。"""
-    h = hashlib.sha1()
-    found = False
+def _apply_defaults_overrides(project_dir):
+    """把 sdkconfig.defaults* 里出现的赋值就地合并进 sdkconfig：已有行覆盖、缺失行
+    追加到末尾；defaults 没提到的 sdkconfig 内容一律不动。不删除、不重命名任何文件。
+    返回是否有修改。"""
+    assignments = {}
     for pattern in ('sdkconfig.defaults', 'sdkconfig.defaults.*'):
-        for f in sorted(_glob.glob(os.path.join(project_dir, pattern))):
-            found = True
-            h.update(os.path.basename(f).encode('utf-8'))
-            with open(f, 'rb') as fh:
-                h.update(fh.read())
-    return h.hexdigest() if found else None
+        for path in sorted(_glob.glob(os.path.join(project_dir, pattern))):
+            with open(path, 'rb') as f:
+                for line in f.read().decode('utf-8', errors='replace').splitlines():
+                    line = line.strip()
+                    if line.startswith('CONFIG_') and '=' in line:
+                        assignments[line.split('=', 1)[0]] = line
+                    elif line.startswith('# CONFIG_') and line.endswith(' is not set'):
+                        assignments[line.split(' ', 2)[1]] = line
+    if not assignments:
+        return False
+    sdk = os.path.join(project_dir, 'sdkconfig')
+    if not os.path.exists(sdk):
+        return False  # 没有 sdkconfig 时交给 idf.py 从 defaults 完整生成
+    with open(sdk, 'rb') as f:
+        lines = f.read().decode('utf-8', errors='replace').splitlines()
+    changed = False
+    seen = set()
+    for i, line in enumerate(lines):
+        key = None
+        if line.startswith('CONFIG_') and '=' in line:
+            key = line.split('=', 1)[0]
+        elif line.startswith('# CONFIG_') and line.endswith(' is not set'):
+            key = line.split(' ', 2)[1]
+        if key and key in assignments:
+            seen.add(key)
+            if line != assignments[key]:
+                lines[i] = assignments[key]
+                changed = True
+    for key, value in assignments.items():
+        if key not in seen:
+            lines.append(value)
+            changed = True
+    if changed:
+        with open(sdk, 'wb') as f:
+            f.write('\n'.join(lines).encode('utf-8') + b'\n')
+    return changed
 
-
-def _defaults_stale(project_dir, build_dir):
-    """defaults 内容与上次构建采用的版本是否不一致（含首次接管，以 defaults 为准）。
-    指纹快照存于 build/config/.idf_mcp_defaults_fp。返回 (是否需要重生成, 指纹)。"""
-    fp = _defaults_fingerprint(project_dir)
-    if fp is None:
-        return False, None
-    snap = os.path.join(build_dir, 'config', '.idf_mcp_defaults_fp')
-    try:
-        with open(snap, encoding='utf-8') as f:
-            if f.read().strip() == fp:
-                return False, fp
-    except OSError:
-        pass
-    return True, fp
 
 @mcp.tool(structured_output=False)
 def build_project(project_dir: str, full_log: bool = False) -> str:
-    """Build ESP-IDF project via idf.py (same as manual `idf.py build`; hand-edited sdkconfig values are auto-detected).
-    If sdkconfig.defaults* changed since the last configure, sdkconfig is treated as stale: it is renamed to
-    sdkconfig.old and fully regenerated from the defaults (so defaults edits override previously conflicting
-    values), then `idf.py reconfigure` is chained before the build. Note: sdkconfig-only hand-edits are reset
-    at that point — mirror them into sdkconfig.defaults if you want them kept.
+    """Build ESP-IDF project via idf.py (same as manual `idf.py build`).
+    Before building, assignments from sdkconfig.defaults* are merged in place into
+    sdkconfig (values overridden, missing lines appended; no file is deleted and
+    anything not mentioned in the defaults is never touched), so defaults edits
+    take effect without manual sdkconfig surgery. Remove an option from the
+    defaults files to stop pinning it.
     Args:
         project_dir: Absolute path to the ESP-IDF project directory
         full_log: If True, return the complete build output (no truncation). If False (default), return only the tail of the output.
     """
-    build_dir = os.path.join(project_dir, 'build')
-    os.makedirs(build_dir, exist_ok=True)
     note = ''
-    actions = ['build']
-    stale, fp = _defaults_stale(project_dir, build_dir)
-    if stale:
-        sdk = os.path.join(project_dir, 'sdkconfig')
-        if os.path.exists(sdk):
-            # defaults 是配置源：删除生成的 sdkconfig 全量重生成，让 defaults 对既有项的修改真正生效
-            os.replace(sdk, sdk + '.old')
-            note = ' (defaults changed: sdkconfig regenerated from defaults; previous copy kept as sdkconfig.old)'
-        actions = ['reconfigure', 'build']
-    rc, out, log_file = _run_sync([IDF_PYTHON, _get_idf_py(), '-C', project_dir] + actions, project_dir)
+    if _apply_defaults_overrides(project_dir):
+        note = ' (sdkconfig.defaults overrides applied to sdkconfig)'
+    rc, out, log_file = _run_sync([IDF_PYTHON, _get_idf_py(), '-C', project_dir, 'build'], project_dir)
     if rc == 0:
-        if fp is not None:
-            os.makedirs(os.path.join(build_dir, 'config'), exist_ok=True)
-            with open(os.path.join(build_dir, 'config', '.idf_mcp_defaults_fp'), 'w', encoding='utf-8') as f:
-                f.write(fp)
         return f'Successfully built project.{note}\n{out if full_log else out[-300:]}'
     else:
         return f'Build failed (exit {rc}): {out if full_log else out[-500:]}{os.linesep}full log: {log_file}'
