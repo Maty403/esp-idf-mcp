@@ -126,23 +126,34 @@ def _run_sync(cmd, cwd, timeout=600):
         return -1, str(e)
 
 
+def _defaults_outdated(project_dir, build_dir):
+    """sdkconfig.defaults* 不在 ninja 的重配触发列表里（官方盲区），
+    用 build.ninja 的 mtime 作为"上次 configure 时间"标记（ninja 生成器每次
+    configure 都会无条件重写它；CMakeCache.txt 在无变化时会被 cmake 跳过，不可靠）。
+    无持久状态。"""
+    marker = os.path.join(build_dir, 'build.ninja')
+    if not os.path.exists(marker):
+        return False  # 尚未配置过，idf.py build 自会完整配置
+    marker_mtime = os.path.getmtime(marker)
+    for pattern in ('sdkconfig.defaults', 'sdkconfig.defaults.*'):
+        for f in _glob.glob(os.path.join(project_dir, pattern)):
+            if os.path.getmtime(f) > marker_mtime:
+                return True
+    return False
+
+
 @mcp.tool(structured_output=False)
 def build_project(project_dir: str, full_log: bool = False) -> str:
-    """Build ESP-IDF project using ninja directly.
+    """Build ESP-IDF project via idf.py (same as manual `idf.py build`; sdkconfig changes are auto-detected).
+    If sdkconfig.defaults* changed since the last configure, an `idf.py reconfigure` is chained before the build.
     Args:
         project_dir: Absolute path to the ESP-IDF project directory
         full_log: If True, return the complete build output (no truncation). If False (default), return only the tail of the output.
     """
     build_dir = os.path.join(project_dir, 'build')
     os.makedirs(build_dir, exist_ok=True)
-    # Configure with cmake if needed
-    cmake_cache = os.path.join(build_dir, 'CMakeCache.txt')
-    if not os.path.exists(cmake_cache):
-        rc, out = _run_sync(['cmake', '-G', 'Ninja', '-DPYTHON_DEPS_CHECKED=1', '-DESP_PLATFORM=1', '-B', build_dir, '-S', project_dir], project_dir)
-        if rc != 0:
-            return f'CMake configure failed: {out if full_log else out[-500:]}'
-    # Build with ninja
-    rc, out = _run_sync(['ninja', '-C', build_dir], project_dir)
+    actions = ['reconfigure', 'build'] if _defaults_outdated(project_dir, build_dir) else ['build']
+    rc, out = _run_sync([IDF_PYTHON, _get_idf_py(), '-C', project_dir] + actions, project_dir)
     if rc == 0:
         return f'Successfully built project.\n{out if full_log else out[-300:]}'
     else:
