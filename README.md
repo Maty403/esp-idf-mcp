@@ -13,8 +13,8 @@ Instead of an agent only being able to *write* firmware code, this server closes
 - **Chip info from real hardware** — `read_chip_info` reports chip model, revision, features, crystal, MAC address, and flash vendor/device/size via esptool, then hard-resets the board back into the running app.
 - **Baud auto-detected** — every serial capture reads `CONFIG_ESP_CONSOLE_UART_BAUDRATE` from the project `sdkconfig` (no hardcoded default), so logs are never garbled.
 - **Session-based serial monitor** — `monitor_open` / `monitor_read` / `monitor_send` / `monitor_close`: a persistent, non-blocking session you poll for *new* lines only. `monitor_close(session_id)` releases exactly the session — or every session on a given port — that you name. `flash_project` opens one automatically after every flash, so the boot log is always ready to poll.
-- **Application-layer log view** — `monitor_read` splits the log stream at the boot marker `main_task: Calling app_main()`: system/boot lines before it are folded into a count (`N system lines folded` in the header), while the marker and everything after it (app, `wifi`, `mqtt`, plain `printf`) is printed line by line. An increment that contains no marker (a plain continuation) is printed as-is, so no line is ever swallowed.
-- **Agent-friendly output** — strips ANSI color escapes, collapses adjacent duplicates into `<line>  *N` (compared with the leading `I (12345) ` prefix ignored, so the same message logged at different milliseconds still collapses), keeps only the relevant tail of long output, and can keep or strip the ms prefix via the `timestamp` switch.
+- **Raw, unprocessed reads** — `monitor_read` returns exactly the lines that arrived since the last read, in order, with no folding, filtering or hidden state. The only bookkeeping is an honest header (`N new lines, M evicted by buffer cap, K older skipped`), so nothing is ever swallowed silently.
+- **Agent-friendly output** — strips ANSI color escapes at the source, keeps only the relevant tail of long output, and reports evicted/skipped counts in the header instead of silently dropping lines.
 - **Survives USB re-enumeration** — after a reset the port can disappear and come back (ESP32-S2/USB-OTG); the read loop reconnects for up to 10 s and clears stale buffered logs.
 - **Hardware-in-the-loop tests** — runs `pytest-embedded` suites against the real board.
 
@@ -30,7 +30,7 @@ Includes a Windows `usbser.sys` workaround (RTS-only control transfers need a DT
 | `set_target` | `idf.py set-target` (esp32, esp32s3, esp32c2, …) |
 | `add_dependency` / `remove_dependency` | Manage ESP component manager dependencies in `idf_component.yml` |
 | `clean_project` | Incremental clean or fullclean |
-| `monitor_open` / `monitor_read` / `monitor_send` / `monitor_close` | Persistent interactive serial session; `monitor_read` shows the application layer from `Calling app_main()` on (system lines folded to a count), folds adjacent duplicates and offers a `timestamp` switch; `monitor_close(session_id)` (or a bare port name) releases exactly that session / port |
+| `monitor_open` / `monitor_read` / `monitor_send` / `monitor_close` | Persistent interactive serial session; `monitor_read` returns the raw lines since the last read — unprocessed by design (`max_lines` caps the tail); `monitor_close(session_id)` (or a bare port name) releases exactly that session / port |
 | `run_pytest` | Run `pytest-embedded` hardware tests |
 | `project://devices` (resource) | List connected serial ports |
 
@@ -46,7 +46,7 @@ The description each tool exposes to the agent, in full:
 
 **`monitor_open(port, reset=True, project_dir=None)`** — Open a persistent serial monitor session and return immediately (non-blocking). `reset=True` hard-resets the board after clearing the buffers, so the session starts from a fresh boot. `project_dir` enables console-baud auto-detection from `sdkconfig` (`CONFIG_ESP_CONSOLE_UART_BAUDRATE`); standalone opens fall back to 115200. The session id is `PORT@BAUD` (e.g. `COM17@115200`).
 
-**`monitor_read(session_id, timestamp=False, max_lines=200)`** — Read the lines that arrived since the last read. The stream is split at the application start marker `main_task: Calling app_main()` (or the first log line tagged `main`): system lines before it are folded into a count — reported as `N system lines folded` in the header — while the marker and everything after it is printed line by line. Adjacent duplicates collapse into `<line>  *N`, and comparison ignores the leading `I (12345) ` prefix, so the same message logged at different milliseconds still collapses. `timestamp=True` keeps that prefix (default strips it to `TAG: msg`). `max_lines` caps the returned lines after folding. An increment with no marker at all is printed as-is.
+**`monitor_read(session_id, max_lines=200)`** — Read the raw lines that arrived since the last read — unprocessed: no folding, no filtering, no timestamp handling. `max_lines` caps the returned lines to the most recent tail; the header reports `N new lines, M evicted by buffer cap, K older skipped (showing last T)`, and an empty increment returns `0 new lines`. Every line is shown exactly as the board printed it (ANSI escapes stripped at the source).
 
 **`monitor_send(session_id, data, press_enter=True)`** — Write text to the device's serial input (shell commands, menu selections); `press_enter` appends CRLF.
 
