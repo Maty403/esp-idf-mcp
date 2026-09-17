@@ -66,7 +66,7 @@ The description each tool exposes to the agent, in full:
 
 - [ESP-IDF](https://docs.espressif.com/projects/esp-idf/) (developed against **v6.1** on **Windows**; other layouts work as long as the auto-detection or the env vars below find your install)
 - Python ≥ 3.9 with `mcp` and `pyserial`
-- An MCP client (ZCode, Claude Desktop, Cursor, …)
+- Any MCP client (Claude Desktop, Cursor, VS Code, …)
 
 ## Setup
 
