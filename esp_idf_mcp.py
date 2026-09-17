@@ -1,3 +1,4 @@
+"""ESP-IDF MCP server: build, flash and serial monitor tools for ESP-IDF projects."""
 import json
 import os
 import re
@@ -7,7 +8,6 @@ import sys
 import threading
 import time
 from collections import deque
-from pathlib import Path
 from typing import Optional
 
 import serial
@@ -112,20 +112,41 @@ _LOG_DIR = os.path.join(tempfile.gettempdir(), 'esp-idf-mcp-logs')
 _LOG_KEEP = 20
 
 
+def _kill_tree(proc):
+    """杀掉子进程及其子孙进程：idf.py 会拉起 cmake/ninja，只杀直接子进程会留下残留
+    （继续占 CPU、锁住 build 目录，导致下一次构建失败）。"""
+    if proc is None:
+        return
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            proc.kill()
+    except Exception:
+        pass
+
+
 def _run_sync(cmd, cwd, timeout=600):
     """Run command synchronously; output goes to a unique persistent log file.
-    Returns (returncode, output, log_file)."""
+    Returns (returncode, output, log_file). On timeout the whole process tree is killed."""
     os.makedirs(_LOG_DIR, exist_ok=True)
     fd, log_file = tempfile.mkstemp(prefix=time.strftime('%Y%m%d_%H%M%S_'), suffix='.log', dir=_LOG_DIR)
     os.close(fd)
+    proc = None
     try:
         with open(log_file, 'w', encoding='utf-8') as f:
             print(f'Running: {" ".join(cmd)} in {cwd}', file=sys.stderr)
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 cmd, stdout=f, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                env=os.environ.copy(), cwd=cwd, timeout=timeout
+                env=os.environ.copy(), cwd=cwd
             )
+            try:
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _kill_tree(proc)
+                rc = -1
         with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
             output = f.read()
         for old in sorted(_glob.glob(os.path.join(_LOG_DIR, '*.log')))[:-_LOG_KEEP]:
@@ -133,101 +154,43 @@ def _run_sync(cmd, cwd, timeout=600):
                 os.remove(old)
             except OSError:
                 pass
-        return result.returncode, output, log_file
-    except subprocess.TimeoutExpired:
-        return -1, f'Timed out after {timeout}s', log_file
+        if rc == -1:
+            return -1, f'Timed out after {timeout}s (process tree killed)', log_file
+        return rc, output, log_file
     except Exception as e:
+        _kill_tree(proc)
         return -1, f'{e}', log_file
-
-
-# 备份文件（sdkconfig.defaults.bak/.old 等）不参与合并，避免旧配置复活
-_BACKUP_RE = re.compile(r'\.(bak|old|orig|backup)$', re.IGNORECASE)
-
-
-def _apply_defaults_overrides(project_dir):
-    """把 sdkconfig.defaults* 里出现的赋值就地合并进 sdkconfig：已有行覆盖、缺失行
-    追加到末尾；defaults 没提到的 sdkconfig 内容一律不动。不删除、不重命名任何文件。
-    备份文件（.bak/.old/.orig/.backup）不参与合并。返回是否有修改。"""
-    assignments = {}
-    for pattern in ('sdkconfig.defaults', 'sdkconfig.defaults.*'):
-        for path in sorted(_glob.glob(os.path.join(project_dir, pattern))):
-            if _BACKUP_RE.search(path):
-                continue
-            with open(path, 'rb') as f:
-                for line in f.read().decode('utf-8', errors='replace').splitlines():
-                    line = line.strip()
-                    if line.startswith('CONFIG_') and '=' in line:
-                        assignments[line.split('=', 1)[0]] = line
-                    elif line.startswith('# CONFIG_') and line.endswith(' is not set'):
-                        assignments[line.split(' ', 2)[1]] = line
-    if not assignments:
-        return False
-    sdk = os.path.join(project_dir, 'sdkconfig')
-    if not os.path.exists(sdk):
-        return False  # 没有 sdkconfig 时交给 idf.py 从 defaults 完整生成
-    with open(sdk, 'rb') as f:
-        lines = f.read().decode('utf-8', errors='replace').splitlines()
-    changed = False
-    seen = set()
-    for i, line in enumerate(lines):
-        key = None
-        if line.startswith('CONFIG_') and '=' in line:
-            key = line.split('=', 1)[0]
-        elif line.startswith('# CONFIG_') and line.endswith(' is not set'):
-            key = line.split(' ', 2)[1]
-        if key and key in assignments:
-            seen.add(key)
-            if line != assignments[key]:
-                lines[i] = assignments[key]
-                changed = True
-    for key, value in assignments.items():
-        if key not in seen:
-            lines.append(value)
-            changed = True
-    if changed:
-        with open(sdk, 'wb') as f:
-            f.write('\n'.join(lines).encode('utf-8') + b'\n')
-    return changed
 
 
 @mcp.tool(structured_output=False)
 def build_project(project_dir: str, full_log: bool = False) -> str:
     """Build ESP-IDF project via idf.py (same as manual `idf.py build`).
-    Before building, assignments from sdkconfig.defaults* are merged in place into
-    sdkconfig (values overridden, missing lines appended; backup files such as
-    .bak/.old are ignored; no file is deleted and
-    anything not mentioned in the defaults is never touched), so defaults edits
-    take effect without manual sdkconfig surgery. Remove an option from the
-    defaults files to stop pinning it.
     Args:
         project_dir: Absolute path to the ESP-IDF project directory
         full_log: If True, return the complete build output (no truncation). If False (default), return only the tail of the output.
     """
-    note = ''
-    if _apply_defaults_overrides(project_dir):
-        note = ' (sdkconfig.defaults overrides applied to sdkconfig)'
     rc, out, log_file = _run_sync([IDF_PYTHON, _get_idf_py(), '-C', project_dir, 'build'], project_dir)
     if rc == 0:
-        return f'Successfully built project.{note}\n{out if full_log else out[-300:]}'
+        return f'Successfully built project.\n{out if full_log else out[-300:]}'
     else:
         return f'Build failed (exit {rc}): {out if full_log else out[-500:]}{os.linesep}full log: {log_file}'
 
 
 @mcp.tool(structured_output=False)
 def flash_project(project_dir: str, port: Optional[str] = None, monitor: bool = True, wait_after_flash: float = 2.0) -> str:
-    """Flash the built project using esptool directly. Optionally opens a persistent monitor session after flash (poll it with monitor_read).
+    """Flash the built project using esptool directly. Optionally opens a persistent monitor session after flash.
     Monitor sessions on the target port are closed automatically before flashing (no manual monitor_close needed).
     Args:
         project_dir: Absolute path to the ESP-IDF project directory
         port: Serial port (e.g. COM13). When omitted, the first non-COM1 port is auto-detected and used. Only monitor sessions on this port are closed before flashing (skip if none open).
-        monitor: Open a persistent monitor session after flashing (default True) so the boot log can be polled with monitor_read. Baud auto-detected from sdkconfig; set False to skip.
+        monitor: Open a persistent monitor session after flashing (default True) so the boot log is captured. Baud auto-detected from sdkconfig; set False to skip.
         wait_after_flash: Seconds to wait after flash before opening the monitor (default 2.0). Lets esptool's hard-reset boot finish, avoiding stale logs in the USB buffer.
     """
     # 烧录前准备：无 port 时先自动检测；确定具体串口后只关闭这个口的监视会话（没开着就跳过）
     if not port:
         port = _autodetect_port()
         if not port:
-            return 'No serial port found (COM1 excluded) — pass port explicitly.'
+            return _no_port_message()
     closed = _close_monitors_on_port(port)
     closed_note = f' (auto-closed monitor: {", ".join(closed)})' if closed else ''
     build_dir = os.path.join(project_dir, 'build')
@@ -243,7 +206,7 @@ def flash_project(project_dir: str, port: Optional[str] = None, monitor: bool = 
         return f'Flash failed (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
     result = f'Successfully flashed to {port}.{closed_note} {out[-200:]}'
     # 烧录后开一个常驻监视会话（reset=True：板子被复位，会话里只有本次启动的新日志），
-    # 立即返回，由 agent 之后用 monitor_read 轮询；不用了用 monitor_close 释放。
+    # 立即返回；不用了用 monitor_close 释放。
     if monitor:
         if wait_after_flash > 0:
             time.sleep(wait_after_flash)
@@ -300,7 +263,7 @@ finally:
 
 @mcp.tool(structured_output=False)
 def read_chip_info(port: str = '', baud: int = 115200) -> str:
-    """Read hardware info from a connected ESP32 board via esptool: chip model, revision, features, crystal freq, MAC address, flash vendor/device/size. The board is briefly put into download mode and hard-reset back to the running app afterwards. Note: PSRAM info is NOT available here (read it from the boot log via monitor_open + monitor_read).
+    """Read hardware info from a connected ESP32 board via esptool: chip model, revision, features, crystal freq, MAC address, flash vendor/device/size. The board is briefly put into download mode and hard-reset back to the running app afterwards. Note: PSRAM info is NOT available here (check the boot log via monitor_open).
     Args:
         port: Serial port (e.g. COM13). Empty = auto-detect (first port, excluding COM1).
         baud: Baud rate for the esptool connection (default 115200).
@@ -308,7 +271,7 @@ def read_chip_info(port: str = '', baud: int = 115200) -> str:
     if not port:
         port = _autodetect_port()
         if not port:
-            return 'No serial port found (COM1 excluded).'
+            return _no_port_message()
     closed = _close_monitors_on_port(port)
     closed_note = f' (auto-closed monitor: {", ".join(closed)})' if closed else ''
     rc, out, log_file = _run_sync([IDF_PYTHON, '-c', _CHIP_INFO_SNIPPET, port, str(baud)], tempfile.gettempdir(), timeout=120)
@@ -337,6 +300,8 @@ def read_chip_info(port: str = '', baud: int = 115200) -> str:
 @mcp.tool(structured_output=False)
 def set_target(project_dir: str, target: str) -> str:
     """Set the ESP-IDF target using idf.py set-target.
+    Warning: idf.py renames the existing sdkconfig to sdkconfig.old and generates a fresh one
+    for the new target, so target-specific settings are not carried over.
     Args:
         project_dir: Absolute path to the ESP-IDF project directory
         target: Target chip (e.g. esp32, esp32s3, esp32c2)
@@ -344,7 +309,9 @@ def set_target(project_dir: str, target: str) -> str:
     cmd = [IDF_PYTHON, _get_idf_py(), 'set-target', target]
     rc, out, log_file = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
-        return f'Target set to: {target}'
+        return (f'Target set to: {target}. Note: idf.py renamed the previous sdkconfig to '
+                f'sdkconfig.old and generated a new one; build_project re-applies '
+                f'sdkconfig.defaults, so keep project settings there.')
     else:
         return f'Failed to set target (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
 
@@ -401,20 +368,31 @@ def clean_project(project_dir: str, full: bool = False) -> str:
         return f'Clean failed (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
 
 
-
-
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')  # ESP_LOG 彩色输出的 ANSI 转义，对 agent 是纯噪声
+# 行首级别+毫秒前缀（'I (12345) '）：ESP_LOG 级别字符为 V/D/I/W/E，折叠比较前剥离
+_LOG_PREFIX_RE = re.compile(r'^([IWEVD]) \((\d+)\) ')
+# 应用层起点：main_task 的 'Calling app_main()'；裁剪过的工程没有该行时回退到 TAG 为 main 的首条日志
+_APP_START_RE = re.compile(r'Calling app_main\b|^[IWEVD] \(\d+\) main:')
 
 
-def _collapse_dupes(lines):
-    """合并相邻重复行（如 SD 卡重试、状态轮询刷屏），xN 标注次数。"""
-    out = []
+def _strip_ts(line: str) -> str:
+    """剥掉行首的 'I (12345) ' 前缀，只用于重复比较，显示仍是原文。"""
+    m = _LOG_PREFIX_RE.match(line)
+    return line[m.end():] if m else line
+
+
+def _fold_repeats(lines, show_ts: bool):
+    """相邻重复行折叠为 `行  *N`（N>1）。比较用剥掉时间戳后的正文，所以毫秒不同、
+    消息相同的日志也算重复；show_ts=False 时显示不带 `I (12345) ` 前缀的正文。"""
+    runs = []  # [正文, 计数, 首行原文]
     for line in lines:
-        if out and out[-1][0] == line:
-            out[-1][1] += 1
+        key = _strip_ts(line)
+        if runs and runs[-1][0] == key:
+            runs[-1][1] += 1
         else:
-            out.append([line, 1])
-    return [l if c == 1 else f'{l}  (x{c})' for l, c in out]
+            runs.append([key, 1, line])
+    return [f'{(first if show_ts else key)}  *{n}' if n > 1 else (first if show_ts else key)
+            for key, n, first in runs]
 
 
 class SerialSession:
@@ -422,7 +400,8 @@ class SerialSession:
         self.port = port
         self.baud = baud
         self.buffer = deque(maxlen=max_lines)
-        self.read_cursor = 0  # 已返回给 agent 的行数；monitor_read 据此只返回新行
+        self.total = 0        # 累计接收行数
+        self.read_cursor = 0  # 已返回的行数（增量读取游标）
         self.running = True
         self.error = None
         self.ser = None
@@ -486,6 +465,7 @@ class SerialSession:
                     pass
                 self.buffer.clear()
                 self.read_cursor = 0
+                self.total = 0  # 与 buffer/游标同步，否则复位后首次 read 会误报 evicted
                 self._hard_reset()
             except serial.SerialException:
                 pass  # CDC 端口复位时断开，静默捕获（重连逻辑会清缓冲）
@@ -497,6 +477,7 @@ class SerialSession:
         except Exception:
             text = str(raw)
         self.buffer.append(text)
+        self.total += 1
 
     def _read_loop(self):
         line_buffer = b''
@@ -531,7 +512,9 @@ class SerialSession:
                         reconnect_waited += 0.5
                         self._open_serial()
                         self.buffer.clear()  # 重连成功后清空旧日志，确保只保留复位后的新日志
-                        self.read_cursor = 0  # 缓冲已清空，游标同步归零
+                        self.read_cursor = 0
+                        self.total = 0     # 与 buffer/游标同步
+                        line_buffer = b''  # 丢弃断线残行，避免和重连后的数据粘成一行
                         print(f'[INFO] Port {self.port} reconnected after {reconnect_waited}s', file=sys.stderr)
                         break
                     except (serial.SerialException, OSError):
@@ -553,33 +536,50 @@ class SerialSession:
 
 
 def _resolve_console_baud(project_dir: Optional[str] = None) -> int:
-    """自动检测 ESP-IDF console 波特率：仅读取工程 sdkconfig 的 CONFIG_ESP_CONSOLE_UART_BAUDRATE，无硬编码默认值。"""
+    """解析串口波特率：有工程目录读 sdkconfig 的 CONFIG_ESP_CONSOLE_UART_BAUDRATE；
+    无工程目录（单独开监视器）或读取失败时回退 115200。"""
     if not project_dir:
-        raise ValueError('未传入 project_dir，无法自动检测波特率，请传入 ESP-IDF 工程目录')
-    with open(os.path.join(project_dir, 'sdkconfig'), encoding='utf-8', errors='replace') as f:
-        for line in f:
-            if line.startswith('CONFIG_ESP_CONSOLE_UART_BAUDRATE='):
-                return int(line.split('=', 1)[1].strip().strip('"'))
-    raise ValueError(f'sdkconfig 中未找到 CONFIG_ESP_CONSOLE_UART_BAUDRATE（{project_dir}）')
+        return 115200
+    try:
+        with open(os.path.join(project_dir, 'sdkconfig'), encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if line.startswith('CONFIG_ESP_CONSOLE_UART_BAUDRATE='):
+                    return int(line.split('=', 1)[1].strip().strip('"'))
+    except (OSError, ValueError):
+        print(f'[WARN] resolve baud from {project_dir} failed, fallback 115200', file=sys.stderr)
+    return 115200
 
 
 # 会话式串口监视器注册表：session_id -> SerialSession（monitor_open/close 维护）
 _MONITORS: dict = {}
 
 
-def _autodetect_port() -> Optional[str]:
-    """First serial port, excluding COM1 (motherboard port). None when nothing is connected.
-    Used by flashing (and chip-info) when no port is passed: auto-detect, then close that one port only."""
+def _serial_ports():
+    """Connected ports, COM1 (motherboard) excluded, in enumeration order (not sorted)."""
     ports = [p.device.strip() for p in list_ports.comports()] if list_ports else []
-    ports = [p for p in ports if p.upper() != 'COM1']
-    return ports[0] if ports else None
+    return [p for p in ports if p.upper() != 'COM1']
+
+
+def _autodetect_port() -> Optional[str]:
+    """The only connected port, else None. Deliberately refuses to pick one out of several:
+    enumeration order is not stable, so silently choosing could flash the wrong board."""
+    ports = _serial_ports()
+    return ports[0] if len(ports) == 1 else None
+
+
+def _no_port_message() -> str:
+    """Error text for callers that need exactly one port but found none or several."""
+    ports = _serial_ports()
+    if not ports:
+        return 'No serial port found (COM1 excluded) — pass port explicitly.'
+    return f'Multiple serial ports found: {", ".join(ports)} — pass port explicitly.'
 
 
 def _close_monitors_on_port(port):
-    """Close open monitor sessions on the given port (exact match, no blanket close)."""
+    """Close open monitor sessions on the given port (case-insensitive, no blanket close)."""
     closed = []
     for sid, sess in list(_MONITORS.items()):
-        if sess.port == port:
+        if sess.port.upper() == port.strip().upper():
             sess.stop()
             _MONITORS.pop(sid, None)
             closed.append(sid)
@@ -588,19 +588,20 @@ def _close_monitors_on_port(port):
 
 @mcp.tool(structured_output=False)
 def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = None) -> str:
-    """Open a persistent serial monitor session. Returns immediately (non-blocking); poll output with monitor_read.
+    """Open a persistent serial monitor session. Returns immediately (non-blocking).
     Args:
         port: Serial port (e.g. COM14)
         reset: Reset the board after opening (default True) so you capture a fresh boot
-        project_dir: Optional project dir to auto-detect console baud from sdkconfig (no default; required for baud detection)
+        project_dir: Project dir for console baud auto-detect (sdkconfig). flash_project passes it automatically; standalone opens fall back to 115200.
     """
-    try:
-        baud = _resolve_console_baud(project_dir)
-    except ValueError as e:
-        return f'无法自动检测波特率：{e}'
+    baud = _resolve_console_baud(project_dir)
     sid = f'{port}@{baud}'
     if sid in _MONITORS:
-        return f'Session {sid} is already open — use monitor_read / monitor_send / monitor_close.'
+        return f'Session {sid} is already open — use monitor_send / monitor_close.'
+    open_on_port = [s for s, sess in _MONITORS.items() if sess.port.upper() == port.strip().upper()]
+    if open_on_port:
+        return (f'{port} is already monitored as {", ".join(open_on_port)} — monitor_close it '
+                f'first if you want to reopen with a different baud.')
     try:
         sess = SerialSession(port, baud)
         sess.start(reset=reset)
@@ -608,51 +609,56 @@ def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = Non
         return f'Failed to open {port}: {e}'
     _MONITORS[sid] = sess
     return (f'Monitor opened: {sid} (reset={"on" if reset else "off"}). '
-            f'Poll with monitor_read, send input with monitor_send, release with monitor_close. '
+            f'Send input with monitor_send, release with monitor_close. '
             f'Note: flashing closes existing sessions on the target port before writing, then opens a fresh one; '
             f'read_chip_info auto-closes sessions on the target port; '
             f'monitor_close(session_id) releases a specific session / port.')
 
 
 @mcp.tool(structured_output=False)
-def monitor_read(session_id: str, wait_for: str = '', timeout: float = 3.0, max_lines: int = 200, compact: bool = True) -> str:
-    """Read new serial output of an open session since the last read. Instant return when no wait_for; set wait_for to block until a line matches (e.g. boot ready / panic) instead of sleeping.
+def monitor_read(session_id: str, timestamp: bool = False, max_lines: int = 200) -> str:
+    """Read new serial output of an open session since the last read.
+
+    应用层起点用正则匹配：`main_task: Calling app_main()`（或 TAG 为 main 的首条日志）。
+    起点之前的系统日志折叠成计数，起点及其后的行原样显示，相邻重复行折叠为 `<行>  *N`
+    （比较时忽略行首时间戳，毫秒不同、消息相同也算重复）。本批日志里找不到起点时，
+    整批按应用日志显示。
     Args:
         session_id: Session id from monitor_open (e.g. 'COM14@74880')
-        wait_for: Optional regex; keep polling up to `timeout` seconds until a new line matches, then return early (~instant on hit)
-        timeout: Max seconds to poll while waiting for wait_for (default 3). Ignored when wait_for is empty.
-        max_lines: Cap on returned lines, keeping the most recent tail (default 200)
-        compact: Collapse consecutive duplicate lines (xN) to save tokens (default True)
+        timestamp: Keep the leading `I (12345) ` ms prefix (default False: stripped, `TAG: msg` only)
+        max_lines: Cap on returned lines after folding (default 200)
     """
     sess = _MONITORS.get(session_id)
     if not sess:
         return f'No session {session_id}. Open one with monitor_open (open sessions: {list(_MONITORS) or "none"}).'
-    try:
-        pattern = re.compile(wait_for) if wait_for else None
-    except re.error as e:
-        return f'Invalid wait_for regex: {e}'
-    lines_all = []
-    matched = pattern is None
-    deadline = time.time() + (timeout if pattern is not None else 0.0)
+
     while True:
-        lines_all = list(sess.buffer)
-        start = min(sess.read_cursor, len(lines_all))
-        new_lines = lines_all[start:]
-        if pattern is not None and any(pattern.search(l) for l in new_lines):
-            matched = True
-        if matched or time.time() >= deadline:
+        total = sess.total  # 先读计数再拷缓冲：拷贝里多出来的行留给下次返回，不丢不重
+        try:
+            lines_all = list(sess.buffer)
             break
-        time.sleep(0.2)
-    sess.read_cursor = len(lines_all)
-    status = f' [wait_for: {"MATCHED" if matched else "not matched within timeout"}]' if pattern is not None else ''
-    if not new_lines:
-        return f'--- {session_id}: 0 new lines{status} ---'
-    tail = new_lines[-max_lines:]
-    skipped = len(new_lines) - len(tail)
-    if compact:
-        tail = _collapse_dupes(tail)
-    header = f'--- {session_id}: {len(new_lines)} new lines' + (f' ({skipped} older skipped, showing last {len(tail)})' if skipped else '')
-    return header + status + f' ---{os.linesep}' + os.linesep.join(tail)
+        except RuntimeError:
+            continue  # 读线程恰在 append（deque 迭代中会抛）；串口速率下重试必然立即成功
+    base = total - len(lines_all)              # 缓冲首行的绝对行号
+    start = max(sess.read_cursor - base, 0)
+    new_lines = lines_all[start:]
+    evicted = max(base - sess.read_cursor, 0)  # 被 5000 行环形缓冲挤掉的未读行数
+    sess.read_cursor = total
+
+    # 正则找应用层起点：之前的系统日志折叠，起点及其后原样显示
+    cut = next((i for i, line in enumerate(new_lines) if _APP_START_RE.search(line)), None)
+    folded = cut if cut is not None else 0
+    app_lines = new_lines[cut:] if cut is not None else new_lines
+
+    shown = _fold_repeats(app_lines, timestamp)
+
+    tail = shown[-max_lines:] if max_lines > 0 and len(shown) > max_lines else shown
+    skipped = len(shown) - len(tail)
+    notes = f', {evicted} evicted by buffer cap' if evicted else ''
+    notes += f', {skipped} older skipped (showing last {len(tail)})' if skipped else ''
+    notes += f', {folded} system lines folded' if folded else ''
+    notes += f', WARNING {sess.error}' if sess.error else ''
+    return os.linesep.join([f'--- {session_id}: {len(new_lines)} new lines{notes} ---'] + tail)
 
 
 @mcp.tool(structured_output=False)
@@ -680,10 +686,11 @@ def monitor_close(session_id: str) -> str:
         session_id: Session id from monitor_open (e.g. 'COM14@74880'), or a bare port ('COM14') to close all sessions on that port.
     """
     target = session_id.strip()
-    if target in _MONITORS:
-        sess = _MONITORS.pop(target)
+    sid = next((s for s in _MONITORS if s.upper() == target.upper()), None)
+    if sid:
+        sess = _MONITORS.pop(sid)
         sess.stop()
-        return f'Monitor closed: {target}. Port {sess.port} released.'
+        return f'Monitor closed: {sid}. Port {sess.port} released.'
     closed = _close_monitors_on_port(target)  # 按端口名匹配（'COM14' → 'COM14@74880'）
     if closed:
         return f'Monitor sessions closed on {target}: {", ".join(closed)}.'
