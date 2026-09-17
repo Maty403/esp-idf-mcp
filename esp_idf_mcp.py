@@ -17,7 +17,7 @@ try:
 except ImportError:
     list_ports = None
 
-# === ESP-IDF 自动定位：环境变量优先，否则扫描常见安装位置取最新版 ===
+# === ESP-IDF auto-discovery: env var first, else scan known install roots for the newest version ===
 import glob as _glob
 
 
@@ -38,7 +38,7 @@ def _find_idf_path():
         found = [os.path.join(base, v, 'esp-idf') for v in os.listdir(base)
                  if os.path.isfile(os.path.join(base, v, 'esp-idf', 'tools', 'idf.py'))]
         if found:
-            return sorted(found)[-1]  # 取版本号最大的
+            return sorted(found)[-1]  # highest version wins
     raise SystemExit('ESP-IDF not found: set IDF_PATH, or install under D:\\esp\\<ver>\\esp-idf')
 
 
@@ -56,25 +56,25 @@ def _find_tools_dir():
 os.environ['PYTHON_DEPS_CHECKED'] = '1'
 IDF_PATH = _find_idf_path()
 os.environ['IDF_PATH'] = IDF_PATH
-# 目录名形如 'v6.1'，但 idf_component_manager 用 Version.coerce 解析该变量，
-# 前导 'v' 会抛 "Version string lacks a numerical component"，导致
-# clean_project / set_target / add_dependency（走 idf.py 的工具）全部失败。
-# 因此这里去掉前导 v：'v6.1' -> '6.1'
+# The dir name looks like 'v6.1', but idf_component_manager's Version.coerce chokes on the
+# leading 'v' (raises "Version string lacks a numerical component"), which breaks
+# clean_project / set_target / add_dependency (the idf.py-based tools).
+# So strip the leading 'v' here: 'v6.1' -> '6.1'
 os.environ['ESP_IDF_VERSION'] = os.path.basename(os.path.dirname(IDF_PATH)).lstrip('vV')
-# 启用 Component Manager：允许 idf.py add-dependency / build 解析并拉取组件
-# (如 esp-nn, esp-tflite-micro)。默认关闭会导致组件依赖无法解析。
+# Enable the Component Manager: lets idf.py add-dependency / build resolve and fetch
+# components (e.g. esp-nn, esp-tflite-micro). Leaving it off breaks dependency resolution.
 os.environ['IDF_COMPONENT_MANAGER'] = '1'
 
 _tools = _find_tools_dir()
 os.environ['IDF_TOOLS_PATH'] = _tools
-# IDF python venv：env 优先，否则 tools 下取最新（安装器随 IDF 版本生成）
+# IDF python venv: env var first, else the newest under tools/ (the installer generates one per IDF version)
 _python_env = os.environ.get('IDF_PYTHON_ENV_PATH') or _newest(os.path.join(_tools, 'python', '*', 'venv'))
 if not _python_env or not os.path.isdir(_python_env):
     raise SystemExit('IDF python venv not found: set IDF_PYTHON_ENV_PATH')
 os.environ['IDF_PYTHON_ENV_PATH'] = _python_env
-IDF_PYTHON = os.path.join(_python_env, 'Scripts', 'python.exe')  # 子进程统一用它（esptool/idf.py/pytest）
+IDF_PYTHON = os.path.join(_python_env, 'Scripts', 'python.exe')  # used for every subprocess (esptool/idf.py/pytest)
 
-# 工具链版本号通配匹配（升级 IDF/工具链无需改代码），注入 PATH
+# Toolchain dirs matched by version wildcard (IDF/toolchain upgrades need no code change), injected into PATH
 _extra_paths = [
     _newest(os.path.join(_tools, 'xtensa-esp-elf', '*', 'xtensa-esp-elf', 'bin')),
     _newest(os.path.join(_tools, 'riscv32-esp-elf', '*', 'riscv32-esp-elf', 'bin')),
@@ -82,15 +82,15 @@ _extra_paths = [
     _newest(os.path.join(_tools, 'cmake', '*', 'bin')),
     _newest(os.path.join(_tools, 'ninja', '*')),
     _newest(os.path.join(_tools, 'idf-exe', '*')),
-    # ninja 用 ccache 当编译器启动器时需要能找到它，否则报
+    # ninja needs ccache findable as the compiler launcher, otherwise it fails with
     # "CreateProcess failed: The system cannot find the file specified"
-    # EIM 布局多嵌一层：ccache\<ver>\ccache-<ver>-windows-x86_64\ccache.exe
+    # EIM layout nests one level deeper: ccache\\<ver>\\ccache-<ver>-windows-x86_64\\ccache.exe
     _newest(os.path.join(_tools, 'ccache', '*', 'ccache-*')) or _newest(os.path.join(_tools, 'ccache', '*')),
     os.path.join(IDF_PATH, 'tools'),
     os.path.join(_python_env, 'Scripts'),
 ]
 
-# 生成 esp_rom gdbinit 需要该变量，缺失时 project.cmake 会打 CMake Warning
+# Required to generate the esp_rom gdbinit; project.cmake emits a CMake warning without it
 _rom_elfs = _newest(os.path.join(_tools, 'esp-rom-elfs', '*'))
 if _rom_elfs and not os.environ.get('ESP_ROM_ELF_DIR'):
     os.environ['ESP_ROM_ELF_DIR'] = _rom_elfs
@@ -107,14 +107,14 @@ def _get_idf_py():
     return os.path.join(os.environ['IDF_PATH'], 'tools', 'idf.py')
 
 
-### 持久日志：每次调用独立文件，互不串扰、可事后回查；只保留最近 _LOG_KEEP 份 ###
+### Persistent logs: one file per call, no cross-talk, kept for later inspection; only the newest _LOG_KEEP are retained ###
 _LOG_DIR = os.path.join(tempfile.gettempdir(), 'esp-idf-mcp-logs')
 _LOG_KEEP = 20
 
 
 def _kill_tree(proc):
-    """杀掉子进程及其子孙进程：idf.py 会拉起 cmake/ninja，只杀直接子进程会留下残留
-    （继续占 CPU、锁住 build 目录，导致下一次构建失败）。"""
+    """Kill the child process and its whole tree: idf.py spawns cmake/ninja, and killing only the direct child leaves orphans
+    (still burning CPU and locking the build dir, which fails the next build)."""
     if proc is None:
         return
     try:
@@ -186,7 +186,7 @@ def flash_project(project_dir: str, port: Optional[str] = None, monitor: bool = 
         monitor: Open a persistent monitor session after flashing (default True) so the boot log is captured. Baud auto-detected from sdkconfig; set False to skip.
         wait_after_flash: Seconds to wait after flash before opening the monitor (default 2.0). Lets esptool's hard-reset boot finish, avoiding stale logs in the USB buffer.
     """
-    # 烧录前准备：无 port 时先自动检测；确定具体串口后只关闭这个口的监视会话（没开着就跳过）
+    # Pre-flash: auto-detect the port when omitted; once known, close only this port's monitor session (skip if none open)
     if not port:
         port = _autodetect_port()
         if not port:
@@ -205,16 +205,16 @@ def flash_project(project_dir: str, port: Optional[str] = None, monitor: bool = 
     if rc != 0:
         return f'Flash failed (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
     result = f'Successfully flashed to {port}.{closed_note} {out[-200:]}'
-    # 烧录后开一个常驻监视会话（reset=True：板子被复位，会话里只有本次启动的新日志），
-    # 立即返回；不用了用 monitor_close 释放。
+    # After flashing, open a persistent monitor session (reset=True: the board is reset, so the session only holds the fresh boot log),
+    # and return immediately; release it with monitor_close when done.
     if monitor:
         if wait_after_flash > 0:
             time.sleep(wait_after_flash)
         result += '\n' + monitor_open(port, reset=True, project_dir=project_dir)
     return result
 
-# 在 venv python 子进程里执行的读芯片信息脚本（esptool 日志走 stdout，
-# 只能放子进程，否则会污染 MCP 的 stdio JSON-RPC 通道）
+# Chip-info snippet executed in a venv-python subprocess (esptool logs go to stdout,
+# which must stay out of this process or it would pollute the MCP stdio JSON-RPC channel)
 _CHIP_INFO_SNIPPET = r'''
 import json, sys
 
@@ -245,12 +245,12 @@ try:
         fid = esp.flash_id()
         info['flash_vendor_id'] = f'0x{fid & 0xFF:02x}'
         info['flash_device_id'] = f'0x{(fid >> 8) & 0xFFFF:04x}'
-        # esptool 5.x 的 detect_flash_size 返回 '4MB' 这类字符串（或 None）
+        # esptool 5.x detect_flash_size returns strings like '4MB' (or None)
         info['flash_size'] = detect_flash_size(esp)
     except Exception as e:
         info['flash_error'] = str(e)
     try:
-        esp.hard_reset()  # 读完硬复位，让应用恢复运行
+        esp.hard_reset()  # hard-reset after reading so the app resumes
     except Exception:
         pass
 except Exception as e:
@@ -275,7 +275,7 @@ def read_chip_info(port: str = '', baud: int = 115200) -> str:
     closed = _close_monitors_on_port(port)
     closed_note = f' (auto-closed monitor: {", ".join(closed)})' if closed else ''
     rc, out, log_file = _run_sync([IDF_PYTHON, '-c', _CHIP_INFO_SNIPPET, port, str(baud)], tempfile.gettempdir(), timeout=120)
-    # 输出里混有 esptool 的连接日志，取最后一行 JSON
+    # esptool connection logs are mixed into the output; take the last JSON line
     json_line = next((l for l in reversed(out.strip().splitlines()) if l.startswith('{')), None)
     if json_line is None:
         return f'Failed to read chip info on {port} (exit {rc}):{closed_note}{os.linesep}{out[-500:]}{os.linesep}full log: {log_file}'
@@ -368,25 +368,26 @@ def clean_project(project_dir: str, full: bool = False) -> str:
         return f'Clean failed (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
 
 
-_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')  # ESP_LOG 彩色输出的 ANSI 转义，对 agent 是纯噪声
-# 行首级别+毫秒前缀（'I (12345) '）：ESP_LOG 级别字符为 V/D/I/W/E，折叠比较前剥离
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')  # ANSI escapes from colored ESP_LOG output - pure noise for the agent
+# Leading level+ms prefix ('I (12345) '): ESP_LOG level chars are V/D/I/W/E; stripped before duplicate comparison
 _LOG_PREFIX_RE = re.compile(r'^([IWEVD]) \((\d+)\) ')
-# 应用层起点：main_task 在 app_main() 返回时打印的这行 —— 之后的日志才是运行时应用日志
-_APP_START_RE = re.compile(r'Returned from app_main\b')
-# 启动段痕迹：本批增量里有这些行说明复位后的启动还没走到 Returned，此时整批折叠、不显示正文
-_BOOT_RE = re.compile(r'ESP-ROM|rst:0x[0-9a-fA-F]|Calling app_main\b')
+# App-layer start: any main_task line mentioning app_main - 'Calling app_main()', 'Returned from app_main()'
+# and any other wording. Hardcoding one exact phrasing is brittle: an IDF or log-level change would hide the marker and fold whole batches.
+_APP_START_RE = re.compile(r'app_main\b')
+# Boot-phase markers: if the increment contains these, the post-reset boot has not reached app_main yet and the whole batch is folded
+_BOOT_RE = re.compile(r'ESP-ROM|rst:0x[0-9a-fA-F]')
 
 
 def _strip_ts(line: str) -> str:
-    """剥掉行首的 'I (12345) ' 前缀，只用于重复比较，显示仍是原文。"""
+    """Strip the leading 'I (12345) ' prefix; used for duplicate comparison only, display keeps the original text."""
     m = _LOG_PREFIX_RE.match(line)
     return line[m.end():] if m else line
 
 
 def _fold_repeats(lines, show_ts: bool):
-    """相邻重复行折叠为 `行  *N`（N>1）。比较用剥掉时间戳后的正文，所以毫秒不同、
-    消息相同的日志也算重复；show_ts=False 时显示不带 `I (12345) ` 前缀的正文。"""
-    runs = []  # [正文, 计数, 首行原文]
+    """Fold adjacent duplicate lines into `line  *N` (N>1). Comparison strips the leading
+    ms prefix, so identical messages logged at different milliseconds still collapse; show_ts=False displays lines without the `I (12345) ` prefix."""
+    runs = []  # [text, count, first line verbatim]
     for line in lines:
         key = _strip_ts(line)
         if runs and runs[-1][0] == key:
@@ -398,16 +399,42 @@ def _fold_repeats(lines, show_ts: bool):
 
 
 class SerialSession:
-    def __init__(self, port, baud, max_lines=5000):
+    def __init__(self, port, baud, max_lines=20000, log_path=None):
         self.port = port
         self.baud = baud
         self.buffer = deque(maxlen=max_lines)
-        self.total = 0        # 累计接收行数
-        self.read_cursor = 0  # 已返回的行数（增量读取游标）
+        self.total = 0        # total lines received
+        self.read_cursor = 0  # lines already returned (incremental cursor; full mode does not advance it)
         self.running = True
         self.error = None
         self.ser = None
         self.thread = None
+        # Session full log: the ring buffer gets evicted and is cleared on reconnect/reset;
+        # only the on-disk file never loses history. Write failures degrade silently (must not take down the reader thread).
+        self.log_path = log_path
+        self._log_fp = None
+        if log_path:
+            try:
+                self._log_fp = open(log_path, 'a', encoding='utf-8', errors='replace')
+                self._log_fp.write(f'==== monitor session {port}@{baud} opened '
+                                   f'{time.strftime("%Y-%m-%d %H:%M:%S")} ====\n')
+                self._log_fp.flush()
+            except OSError as e:
+                print(f'[WARN] monitor log file {log_path} unavailable: {e}', file=sys.stderr)
+                self._log_fp = None
+
+    def _log_write(self, text):
+        if not self._log_fp:
+            return
+        try:
+            self._log_fp.write(text + '\n')
+            self._log_fp.flush()
+        except Exception:
+            try:
+                self._log_fp.close()
+            except Exception:
+                pass
+            self._log_fp = None
 
     def _open_serial(self):
         if self.ser and self.ser.is_open:
@@ -424,32 +451,32 @@ class SerialSession:
         self.ser.dsrdtr = False
         self.ser.xonxoff = False
         self.ser.open()
-        # 打开后先不改变 RTS/DTR，等读线程启动后再统一处理
-        # （避免打开时就触发复位，导致丢失首行日志）
+        # Do not touch RTS/DTR right after opening; handle them once the reader thread is up
+        # (toggling them during open would reset the board and lose the first log lines)
 
     def _set_rts(self, state):
-        """设置 RTS，包含 Windows usbser.sys workaround。
+        """Set RTS, working around a Windows usbser.sys quirk.
         
-        Windows usbser.sys 驱动在仅改变 RTS 时不会发送 SET_CONTROL_LINE_STATE 请求，
-        必须显式设置 DTR（即使值不变）才能强制发送控制请求。
+        The Windows usbser.sys driver does not send SET_CONTROL_LINE_STATE when only RTS changes;
+        explicitly assigning DTR (even unchanged) forces the request out.
         """
         self.ser.rts = state
-        self.ser.dtr = self.ser.dtr  # 强制发送 SET_CONTROL_LINE_STATE
+        self.ser.dtr = self.ser.dtr  # force the SET_CONTROL_LINE_STATE request out
 
     def _hard_reset(self):
-        """RTS 下降沿触发复位（ESP32-S2 ROM CDC 机制）。
+        """A falling RTS edge triggers a reset (ESP32-S2 ROM CDC mechanism).
         
-        ESP32-S2 ROM CDC 驱动：RTS 下降沿（True→False）触发复位，
-        DTR=False → REBOOT_NORMAL（普通重启，运行应用）
-        DTR=True → REBOOT_BOOTLOADER（进入下载模式）
+        ESP32-S2 ROM CDC driver: an RTS falling edge (True→False) resets the chip;
+        DTR=False → REBOOT_NORMAL (normal reboot, app runs)
+        DTR=True → REBOOT_BOOTLOADER (download mode)
         
-        对 CH340 等物理串口：RTS 直接控制 EN，也能正常复位
+        On physical UART bridges (CH340 etc.) RTS directly drives EN, so this resets them too.
         """
         try:
-            self.ser.dtr = False  # 确保普通重启
-            self._set_rts(True)   # RTS 上升沿
+            self.ser.dtr = False  # make sure we get a normal reboot
+            self._set_rts(True)   # RTS rising edge
             time.sleep(0.05)
-            self._set_rts(False)  # RTS 下降沿 → 触发复位
+            self._set_rts(False)  # RTS falling edge -> triggers the reset
         except Exception as e:
             print(f'[WARN] Hard reset failed: {e}', file=sys.stderr)
 
@@ -460,26 +487,28 @@ class SerialSession:
         if reset:
             time.sleep(0.05)
             try:
-                # 复位前丢弃 CDC/驱动缓冲区里的陈旧数据，避免上一轮启动日志混进本次抓取
+                # Discard stale data buffered in the CDC/driver before the reset, so the previous boot's logs do not mix into this capture
                 try:
                     self.ser.reset_input_buffer()
                 except Exception:
                     pass
                 self.buffer.clear()
                 self.read_cursor = 0
-                self.total = 0  # 与 buffer/游标同步，否则复位后首次 read 会误报 evicted
+                self.total = 0  # keep in sync with buffer/cursor, otherwise the first read after reset falsely reports evicted
                 self._hard_reset()
+                self._log_write('==== board reset ====')
             except serial.SerialException:
-                pass  # CDC 端口复位时断开，静默捕获（重连逻辑会清缓冲）
+                pass  # the CDC port disappears during reset; swallow it (the reconnect logic clears the buffers)
 
     def _append_line(self, raw: bytes):
-        """将原始字节解码、去 ANSI 转义后存入缓冲区，容错处理"""
+        """Decode raw bytes, strip ANSI escapes, store into the buffer - fault tolerant"""
         try:
             text = _ANSI_RE.sub('', raw.decode('utf-8', errors='replace')).rstrip('\r')
         except Exception:
             text = str(raw)
         self.buffer.append(text)
         self.total += 1
+        self._log_write(text)
 
     def _read_loop(self):
         line_buffer = b''
@@ -505,22 +534,23 @@ class SerialSession:
                         self.ser.close()
                 except Exception:
                     pass
-                # 复位后端口会消失并重新枚举（USB-OTG），需等待 0.5-2 秒
-                # 参考 idf_monitor 的重连逻辑：0.5s 间隔，最多 10 秒
+                # After a reset the port disappears and re-enumerates (USB-OTG); allow 0.5-2 s
+                # Reconnect logic modeled on idf_monitor: 0.5 s interval, up to 10 s
                 reconnect_waited = 0
                 while self.running:
                     try:
-                        time.sleep(0.5)  # 官方推荐间隔
+                        time.sleep(0.5)  # officially recommended interval
                         reconnect_waited += 0.5
                         self._open_serial()
-                        self.buffer.clear()  # 重连成功后清空旧日志，确保只保留复位后的新日志
+                        self.buffer.clear()  # On successful reconnect clear the old logs so only post-reset lines are kept
                         self.read_cursor = 0
-                        self.total = 0     # 与 buffer/游标同步
-                        line_buffer = b''  # 丢弃断线残行，避免和重连后的数据粘成一行
+                        self.total = 0     # keep in sync with buffer/cursor
+                        line_buffer = b''  # drop the partial line from before the disconnect so it cannot glue onto reconnected data
+                        self._log_write(f'==== port reconnected after {reconnect_waited}s ====')
                         print(f'[INFO] Port {self.port} reconnected after {reconnect_waited}s', file=sys.stderr)
                         break
                     except (serial.SerialException, OSError):
-                        if reconnect_waited >= 10:  # 最多等 10 秒
+                        if reconnect_waited >= 10:  # give up after 10 s
                             self.error = f'Port re-enumeration failed after {reconnect_waited}s'
                             self.running = False
                             return
@@ -535,11 +565,17 @@ class SerialSession:
                 pass
         if self.thread:
             self.thread.join(timeout=2)
+        if self._log_fp:
+            try:
+                self._log_fp.close()
+            except Exception:
+                pass
+            self._log_fp = None
 
 
 def _resolve_console_baud(project_dir: Optional[str] = None) -> int:
-    """解析串口波特率：有工程目录读 sdkconfig 的 CONFIG_ESP_CONSOLE_UART_BAUDRATE；
-    无工程目录（单独开监视器）或读取失败时回退 115200。"""
+    """Resolve the serial baud rate: read CONFIG_ESP_CONSOLE_UART_BAUDRATE from the project's sdkconfig when
+    a project dir is given; fall back to 115200 when standalone (or on read failure)."""
     if not project_dir:
         return 115200
     try:
@@ -552,7 +588,7 @@ def _resolve_console_baud(project_dir: Optional[str] = None) -> int:
     return 115200
 
 
-# 会话式串口监视器注册表：session_id -> SerialSession（monitor_open/close 维护）
+# Session-based serial monitor registry: session_id -> SerialSession (maintained by monitor_open/close)
 _MONITORS: dict = {}
 
 
@@ -604,13 +640,20 @@ def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = Non
     if open_on_port:
         return (f'{port} is already monitored as {", ".join(open_on_port)} — monitor_close it '
                 f'first if you want to reopen with a different baud.')
+    # Session full log: into the project root when a project dir is given (.esp_monitor_full.log, easy to find), else into the temp dir
+    if project_dir:
+        log_path = os.path.join(project_dir, '.esp_monitor_full.log')
+    else:
+        os.makedirs(_LOG_DIR, exist_ok=True)
+        log_path = os.path.join(_LOG_DIR, f'monitor_{port}_{time.strftime("%Y%m%d_%H%M%S")}.log')
     try:
-        sess = SerialSession(port, baud)
+        sess = SerialSession(port, baud, log_path=log_path)
         sess.start(reset=reset)
     except serial.SerialException as e:
         return f'Failed to open {port}: {e}'
     _MONITORS[sid] = sess
     return (f'Monitor opened: {sid} (reset={"on" if reset else "off"}). '
+            f'Full serial log (every line, survives buffer eviction/reconnect): {log_path}. '
             f'Send input with monitor_send, release with monitor_close. '
             f'Note: flashing closes existing sessions on the target port before writing, then opens a fresh one; '
             f'read_chip_info auto-closes sessions on the target port; '
@@ -618,56 +661,77 @@ def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = Non
 
 
 @mcp.tool(structured_output=False)
-def monitor_read(session_id: str, full: bool = False, timestamp: bool = False, max_lines: int = 200) -> str:
+def monitor_read(session_id: str, full: bool = False, timestamp: bool = False, max_lines: int = 0) -> str:
     """Read new serial output of an open session since the last read.
 
-    应用层起点用正则匹配 `main_task: Returned from app_main()`：起点之前的行（启动段 + app_main
-    内部初始化日志）折叠成计数，起点及其后的行原样显示，相邻重复行折叠为 `<首行内容>  *N`
-    （比较时忽略行首时间戳，毫秒不同、消息相同也算重复）。本批增量里既没有起点、也没有启动段
-    痕迹时（普通续读），整批直接显示。
+    Default (full=False): incremental read. Lines before the app-layer start
+    (any main_task line mentioning app_main) - boot ROM / bootloader output -
+    are folded into a count; from the marker on, lines are shown as-is with
+    adjacent duplicates folded into `<first line>  *N` (comparison ignores the
+    leading ms timestamp). max_lines>0 returns only the last N lines.
+
+    full=True: cursor-independent true full dump - emits every line retained
+    in the buffer, verbatim and unfolded, without advancing the incremental
+    cursor; max_lines>0 returns only the last N lines. Lines already evicted
+    from the ring, and the complete history across reconnects/resets, live in
+    the full log file returned by monitor_open.
     Args:
         session_id: Session id from monitor_open (e.g. 'COM14@74880')
-        full: Return the increment verbatim — no folding, no layer split, timestamps as-is (default False)
-        timestamp: Keep the leading `I (12345) ` ms prefix (default False: stripped, `TAG: msg` only)
-        max_lines: Cap on returned lines (default 200)
+        full: Dump everything retained in the buffer verbatim, independent of
+            the incremental cursor (default False = incremental folded view)
+        timestamp: Keep the leading `I (12345) ` ms prefix (default False:
+            stripped, `TAG: msg` only)
+        max_lines: Optional cap on returned lines (0 = no cap, the default)
     """
     sess = _MONITORS.get(session_id)
     if not sess:
         return f'No session {session_id}. Open one with monitor_open (open sessions: {list(_MONITORS) or "none"}).'
 
     while True:
-        total = sess.total  # 先读计数再拷缓冲：拷贝里多出来的行留给下次返回，不丢不重
+        total = sess.total  # read the counter before copying the buffer: lines appended during the copy are left for the next read - no loss, no duplication
         try:
             lines_all = list(sess.buffer)
             break
         except RuntimeError:
-            continue  # 读线程恰在 append（deque 迭代中会抛）；串口速率下重试必然立即成功
-    base = total - len(lines_all)              # 缓冲首行的绝对行号
+            continue  # the reader thread appended mid-iteration (deque raises); at serial rates the retry succeeds immediately
+    base = total - len(lines_all)              # absolute line number of the buffer head (= lines evicted by the ring so far)
+
+    if full:
+        # Cursor-independent true full dump: emit every line kept in the buffer without advancing the incremental cursor (the two read modes never interfere)
+        shown = lines_all
+        if max_lines > 0 and len(shown) > max_lines:
+            shown = shown[-max_lines:]
+        header = (f'--- {session_id}: full dump, showing {len(shown)} of {len(lines_all)} retained '
+                  f'lines ({total} total received, {base} evicted by buffer cap); '
+                  f'log file: {sess.log_path or "<not enabled>"} ---')
+        return os.linesep.join([header] + shown)
+
     start = max(sess.read_cursor - base, 0)
     new_lines = lines_all[start:]
-    evicted = max(base - sess.read_cursor, 0)  # 被 5000 行环形缓冲挤掉的未读行数
+    evicted = max(base - sess.read_cursor, 0)  # unread lines evicted by the ring buffer
     sess.read_cursor = total
 
-    if full:                                   # 全量：本批原始行直接返回，不折叠不分层
-        folded, shown = 0, new_lines
+    # Find the app-layer start: fold everything before it, show it and what follows. When the batch has no marker, check whether it is still in the boot phase:
+    # boot markers present (not yet past "Returned") -> fold the whole batch; otherwise it is a plain continuation -> show it all
+    cut = next((i for i, line in enumerate(new_lines) if _APP_START_RE.search(line)), None)
+    if cut is not None:
+        folded = cut
+    elif any(_BOOT_RE.search(line) for line in new_lines):
+        folded = len(new_lines)
     else:
-        # 找应用层起点：之前的行折叠，起点及其后显示。本批没有起点时看它是不是启动段：
-        # 带启动痕迹（还没跑到 Returned）→ 整批不显示；否则是普通续读 → 整批显示
-        cut = next((i for i, line in enumerate(new_lines) if _APP_START_RE.search(line)), None)
-        if cut is not None:
-            folded = cut
-        elif any(_BOOT_RE.search(line) for line in new_lines):
-            folded = len(new_lines)
-        else:
-            folded = 0
-        shown = _fold_repeats(new_lines[folded:], timestamp)
+        folded = 0
+    shown = _fold_repeats(new_lines[folded:], timestamp)
 
-    tail = shown[-max_lines:] if max_lines > 0 and len(shown) > max_lines else shown
-    skipped = len(shown) - len(tail)
+    if max_lines > 0 and len(shown) > max_lines:
+        tail = shown[-max_lines:]
+        skipped = len(shown) - len(tail)
+    else:
+        tail, skipped = shown, 0
     notes = f', {evicted} evicted by buffer cap' if evicted else ''
     notes += f', {skipped} older skipped (showing last {len(tail)})' if skipped else ''
     notes += f', {folded} lines folded before app start' if folded else ''
-    notes += ', full raw' if full else ''
+    if folded and folded == len(new_lines):
+        notes += f' (no app-start marker yet; full serial log: {sess.log_path or "<not enabled>"})'
     notes += f', WARNING {sess.error}' if sess.error else ''
     return os.linesep.join([f'--- {session_id}: {len(new_lines)} new lines{notes} ---'] + tail)
 
@@ -702,7 +766,7 @@ def monitor_close(session_id: str) -> str:
         sess = _MONITORS.pop(sid)
         sess.stop()
         return f'Monitor closed: {sid}. Port {sess.port} released.'
-    closed = _close_monitors_on_port(target)  # 按端口名匹配（'COM14' → 'COM14@74880'）
+    closed = _close_monitors_on_port(target)  # match by port name ('COM14' -> 'COM14@74880')
     if closed:
         return f'Monitor sessions closed on {target}: {", ".join(closed)}.'
     return f'No session {target} (open sessions: {list(_MONITORS) or "none"}).'
@@ -747,17 +811,16 @@ def get_connected_devices() -> str:
         return f'Error getting devices: {e}'
 
 def main():
-    """Start the MCP server with auto-restart on crash (also the pip console entry point)."""
-    while True:
-        try:
-            mcp.run()
-            break
-        except KeyboardInterrupt:
-            print('\nMCP Server stopped by user.')
-            break
-        except Exception as e:
-            print(f'MCP Server crashed: {e}, restarting in 3 seconds...', file=sys.stderr)
-            time.sleep(3)
+    """Run the MCP server on stdio. Its lifetime follows the client: the process exits when
+    the client closes the pipe, and a crash exits too — whether to restart it is the MCP
+    client's decision, not ours."""
+    try:
+        mcp.run()
+    except KeyboardInterrupt:
+        print('\nMCP Server stopped by user.')
+    except Exception as e:
+        print(f'MCP Server stopped: {e}', file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':

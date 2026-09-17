@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.1 (2026-09-18)
+
+- **Persistent full serial log per session** — every line the monitor receives is flushed to `<project_dir>/.esp_monitor_full.log` (or a temp-dir file for standalone opens) as it arrives. The ring buffer only holds the recent 20 000 lines, but the file keeps everything: history survives buffer eviction, USB re-enumeration, board resets and session close. Session open, board reset and port re-connect write separator lines into the file; `monitor_open` returns the path.
+- **`monitor_read(full=True)` redefined as a cursor-independent full dump** — it now emits every line retained in the ring buffer verbatim (no folding, no layer split, timestamps untouched) and does *not* advance the incremental cursor, so the folded and full views can be interleaved freely without one consuming the other's lines. Previously `full=True` shared the cursor with the folded view, so a folded read consumed the lines and `full=True` afterwards reported `0 new lines`. `max_lines` now caps the tail in full mode too (0 = everything retained).
+- Ring buffer raised from 5 000 to 20 000 lines; evictions are still reported honestly in the header, and anything evicted lives in the log file.
+- All remaining Chinese header docs and inline comments translated to English — the tool docstrings (what MCP clients show their agents) are now uniformly English.
+
 ## v0.4.0 (2026-09-18)
 
 - `build_project` is back to a plain `idf.py build`: the in-place `sdkconfig.defaults` merge added in v0.3.0 was removed, so `sdkconfig.defaults` keeps its official upstream semantics again — the defaults files seed a fresh `sdkconfig` (generic one, plus `sdkconfig.defaults.<target>` when the generic one exists), while values already present in `sdkconfig` win. To fold menuconfig results back into the defaults files, use the upstream `idf.py save-defconfig`.
