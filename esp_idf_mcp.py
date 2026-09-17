@@ -371,8 +371,10 @@ def clean_project(project_dir: str, full: bool = False) -> str:
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')  # ESP_LOG 彩色输出的 ANSI 转义，对 agent 是纯噪声
 # 行首级别+毫秒前缀（'I (12345) '）：ESP_LOG 级别字符为 V/D/I/W/E，折叠比较前剥离
 _LOG_PREFIX_RE = re.compile(r'^([IWEVD]) \((\d+)\) ')
-# 应用层起点：main_task 的 'Calling app_main()'；裁剪过的工程没有该行时回退到 TAG 为 main 的首条日志
-_APP_START_RE = re.compile(r'Calling app_main\b|^[IWEVD] \(\d+\) main:')
+# 应用层起点：main_task 在 app_main() 返回时打印的这行 —— 之后的日志才是运行时应用日志
+_APP_START_RE = re.compile(r'Returned from app_main\b')
+# 启动段痕迹：本批增量里有这些行说明复位后的启动还没走到 Returned，此时整批折叠、不显示正文
+_BOOT_RE = re.compile(r'ESP-ROM|rst:0x[0-9a-fA-F]|Calling app_main\b')
 
 
 def _strip_ts(line: str) -> str:
@@ -616,17 +618,18 @@ def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = Non
 
 
 @mcp.tool(structured_output=False)
-def monitor_read(session_id: str, timestamp: bool = False, max_lines: int = 200) -> str:
+def monitor_read(session_id: str, full: bool = False, timestamp: bool = False, max_lines: int = 200) -> str:
     """Read new serial output of an open session since the last read.
 
-    应用层起点用正则匹配：`main_task: Calling app_main()`（或 TAG 为 main 的首条日志）。
-    起点之前的系统日志折叠成计数，起点及其后的行原样显示，相邻重复行折叠为 `<行>  *N`
-    （比较时忽略行首时间戳，毫秒不同、消息相同也算重复）。本批日志里找不到起点时，
-    整批按应用日志显示。
+    应用层起点用正则匹配 `main_task: Returned from app_main()`：起点之前的行（启动段 + app_main
+    内部初始化日志）折叠成计数，起点及其后的行原样显示，相邻重复行折叠为 `<首行内容>  *N`
+    （比较时忽略行首时间戳，毫秒不同、消息相同也算重复）。本批增量里既没有起点、也没有启动段
+    痕迹时（普通续读），整批直接显示。
     Args:
         session_id: Session id from monitor_open (e.g. 'COM14@74880')
+        full: Return the increment verbatim — no folding, no layer split, timestamps as-is (default False)
         timestamp: Keep the leading `I (12345) ` ms prefix (default False: stripped, `TAG: msg` only)
-        max_lines: Cap on returned lines after folding (default 200)
+        max_lines: Cap on returned lines (default 200)
     """
     sess = _MONITORS.get(session_id)
     if not sess:
@@ -645,18 +648,26 @@ def monitor_read(session_id: str, timestamp: bool = False, max_lines: int = 200)
     evicted = max(base - sess.read_cursor, 0)  # 被 5000 行环形缓冲挤掉的未读行数
     sess.read_cursor = total
 
-    # 正则找应用层起点：之前的系统日志折叠，起点及其后原样显示
-    cut = next((i for i, line in enumerate(new_lines) if _APP_START_RE.search(line)), None)
-    folded = cut if cut is not None else 0
-    app_lines = new_lines[cut:] if cut is not None else new_lines
-
-    shown = _fold_repeats(app_lines, timestamp)
+    if full:                                   # 全量：本批原始行直接返回，不折叠不分层
+        folded, shown = 0, new_lines
+    else:
+        # 找应用层起点：之前的行折叠，起点及其后显示。本批没有起点时看它是不是启动段：
+        # 带启动痕迹（还没跑到 Returned）→ 整批不显示；否则是普通续读 → 整批显示
+        cut = next((i for i, line in enumerate(new_lines) if _APP_START_RE.search(line)), None)
+        if cut is not None:
+            folded = cut
+        elif any(_BOOT_RE.search(line) for line in new_lines):
+            folded = len(new_lines)
+        else:
+            folded = 0
+        shown = _fold_repeats(new_lines[folded:], timestamp)
 
     tail = shown[-max_lines:] if max_lines > 0 and len(shown) > max_lines else shown
     skipped = len(shown) - len(tail)
     notes = f', {evicted} evicted by buffer cap' if evicted else ''
     notes += f', {skipped} older skipped (showing last {len(tail)})' if skipped else ''
-    notes += f', {folded} system lines folded' if folded else ''
+    notes += f', {folded} lines folded before app start' if folded else ''
+    notes += ', full raw' if full else ''
     notes += f', WARNING {sess.error}' if sess.error else ''
     return os.linesep.join([f'--- {session_id}: {len(new_lines)} new lines{notes} ---'] + tail)
 
