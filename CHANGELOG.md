@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.0 (2026-09-19)
+
+- **`monitor_read(match=…)` regex filter** — pull one topic out of a noisy log: a case-insensitive regex matched against the line text (level/ms prefix stripped), with `|` separating alternatives (`match='heap|wifi|dhcp'`). When set, the app-start folding is bypassed and only matching lines are returned; filtered-out lines are still consumed by the incremental cursor, and `match` combines with `full=True` to re-scan everything retained in the buffer.
+- **Critical ESP-IDF lines always pass through the filter** — every ESP_LOG error-level line (`E (…)`) plus the panic-handler prints that carry no log-level prefix (Guru Meditation / `panic'ed`, `abort() was called`, `assert failed`, `Backtrace:`, stack canary, watchdog and brownout triggers, `CORRUPT HEAP`, core dumps, reset reasons, `Rebooting…`) are baked into every filtered read, so a filtered view never hides a crash. Not a parameter — the agent just sees them come through. Validated against a 4 000-line real ESP32-S3 session log containing an actual `assert failed` crash: the panic lines have no `E (` prefix and would have been invisible to a plain filter.
+
 ## v0.5.0 (2026-09-18)
 
 - **Sessions now free their own port** — every session opened by `monitor_open` carries a lightweight watchdog: after `idle_release` seconds (default 30, new per-call parameter) with no `monitor_read`/`monitor_send`, the session stops itself, releases the COM port and leaves the registry. Any read or write resets the timer (sending counts too, so send-then-read gaps do not reap a session mid-work). This fixes the port-stuck failure mode where an MCP client abandons the server process without closing the stdio pipes — the session used to hold the port until the process was killed by hand, and because the read loop re-grabs the port after USB re-enumeration, even unplug/replug did not help. Pass a larger `idle_release` to bridge a long pause; if a call reports `No session`, just `monitor_open` again (full history stays in the log file).

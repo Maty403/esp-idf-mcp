@@ -179,13 +179,12 @@ def build_project(project_dir: str, full_log: bool = False) -> str:
 
 @mcp.tool(structured_output=False)
 def flash_project(project_dir: str, port: Optional[str] = None, monitor: bool = True, wait_after_flash: float = 2.0) -> str:
-    """Flash the built project using esptool directly. Optionally opens a persistent monitor session after flash.
-    Monitor sessions on the target port are closed automatically before flashing (no manual monitor_close needed).
+    """Flash the built project with esptool, then open a monitor session on the port (default).
     Args:
         project_dir: Absolute path to the ESP-IDF project directory
-        port: Serial port (e.g. COM13). When omitted, the first non-COM1 port is auto-detected and used. Only monitor sessions on this port are closed before flashing (skip if none open).
-        monitor: Open a persistent monitor session after flashing (default True) so the boot log is captured. Baud auto-detected from sdkconfig; set False to skip.
-        wait_after_flash: Seconds to wait after flash before opening the monitor (default 2.0). Lets esptool's hard-reset boot finish, avoiding stale logs in the USB buffer.
+        port: Serial port (e.g. COM13); auto-detected when omitted (only if exactly one non-COM1 port). Monitor sessions on this port are closed before flashing.
+        monitor: Open a monitor session after flashing (default True)
+        wait_after_flash: Seconds to let the hard-reset boot finish before opening the monitor (default 2.0)
     """
     # Pre-flash: auto-detect the port when omitted; once known, close only this port's monitor session (skip if none open)
     if not port:
@@ -377,6 +376,18 @@ _LOG_PREFIX_RE = re.compile(r'^([IWEVD]) \((\d+)\) ')
 _APP_START_RE = re.compile(r'app_main\b')
 # Boot-phase markers: if the increment contains these, the post-reset boot has not reached app_main yet and the whole batch is folded
 _BOOT_RE = re.compile(r'ESP-ROM|rst:0x[0-9a-fA-F]')
+# Phrases baked into every monitor_read(match=...) filter: a filtered view must never hide a crash.
+# `E (...)` catches every ESP_LOG error-level line; the rest are panic-handler prints that carry no
+# log-level prefix, plus reset reasons (canonical wording per docs: api-guides/fatal-errors.html).
+# Not exposed as a parameter — the agent just sees these lines come through.
+_CRITICAL_LOG_RE = re.compile(
+    r'^E \(\d+\)'
+    r'|Guru Meditation Error|panic\'ed'
+    r'|abort\(\) was called|assertion .* failed|assert failed'
+    r'|Stack canary watchpoint triggered|Stack smashing protect failure|CORRUPT HEAP'
+    r'|Brownout detector was triggered|watchdog got triggered|Interrupt [Ww]atchdog'
+    r'|Backtrace:|core ?dump|Rebooting\.\.\.|^rst:|ESP_ERROR_CHECK failed'
+)
 
 
 def _strip_ts(line: str) -> str:
@@ -660,9 +671,9 @@ def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = Non
     """Open a persistent serial monitor session. Returns immediately (non-blocking).
     Args:
         port: Serial port (e.g. COM14)
-        reset: Reset the board after opening (default True) so you capture a fresh boot
-        project_dir: Project dir for console baud auto-detect (sdkconfig). flash_project passes it automatically; standalone opens fall back to 115200.
-        idle_release: Seconds without monitor_read/monitor_send before the session auto-releases the port (default 30). Pass a longer value to keep the session across a long pause, or monitor_close explicitly when done.
+        reset: Hard-reset the board after opening, so the session captures a fresh boot (default True)
+        project_dir: Project dir for baud auto-detect (sdkconfig); the session full log goes to its .esp_monitor_full.log
+        idle_release: Seconds without monitor_read/monitor_send before the session auto-releases the port (default 30). Reopen if a call reports "No session".
     """
     baud = _resolve_console_baud(project_dir)
     sid = f'{port}@{baud}'
@@ -685,38 +696,26 @@ def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = Non
         return f'Failed to open {port}: {e}'
     _MONITORS[sid] = sess
     threading.Thread(target=_idle_watchdog, args=(sess, sid, idle_release), daemon=True).start()
-    return (f'Monitor opened: {sid} (reset={"on" if reset else "off"}). '
-            f'Full serial log (every line, survives buffer eviction/reconnect): {log_path}. '
-            f'Send input with monitor_send, release with monitor_close. '
-            f'Auto-release: after {idle_release:g}s with no monitor_read/monitor_send the session frees '
-            f'the port — if the session is gone ("No session"), just monitor_open again (history stays in the log file). '
-            f'Note: flashing closes existing sessions on the target port before writing, then opens a fresh one; '
-            f'read_chip_info auto-closes sessions on the target port; '
-            f'monitor_close(session_id) releases a specific session / port.')
+    return (f'Monitor opened: {sid} (reset={"on" if reset else "off"}); full log: {log_path}. '
+            f'Idle >{idle_release:g}s auto-releases the port - reopen if the session is gone.')
 
 
 @mcp.tool(structured_output=False)
-def monitor_read(session_id: str, full: bool = False, timestamp: bool = False, max_lines: int = 0) -> str:
+def monitor_read(session_id: str, full: bool = False, timestamp: bool = False, max_lines: int = 0,
+                 match: str = '') -> str:
     """Read new serial output of an open session since the last read.
-
-    Default (full=False): incremental read. Lines before the app-layer start
-    (any main_task line mentioning app_main) - boot ROM / bootloader output -
-    are folded into a count; from the marker on, lines are shown as-is with
-    adjacent duplicates folded into `<first line>  *N` (comparison ignores the
-    leading ms timestamp). max_lines>0 returns only the last N lines.
-
-    full=True: cursor-independent true full dump - emits every line retained
-    in the buffer, verbatim and unfolded, without advancing the incremental
-    cursor; max_lines>0 returns only the last N lines. Lines already evicted
-    from the ring, and the complete history across reconnects/resets, live in
-    the full log file returned by monitor_open.
+    Default: incremental view - boot output before `app_main` is folded into a count, duplicate
+    lines collapse to `line  *N`; the header reports counts and evictions.
+    full=True: verbatim dump of everything retained in the buffer, without advancing the cursor
+    (evicted lines and full history live in the log file from monitor_open).
+    match: case-insensitive regex on the line text, '|' for several alternatives ('wifi|error');
+    crash/error lines (E-level logs, panics, backtraces, reset reasons) always pass through.
     Args:
         session_id: Session id from monitor_open (e.g. 'COM14@74880')
-        full: Dump everything retained in the buffer verbatim, independent of
-            the incremental cursor (default False = incremental folded view)
-        timestamp: Keep the leading `I (12345) ` ms prefix (default False:
-            stripped, `TAG: msg` only)
-        max_lines: Optional cap on returned lines (0 = no cap, the default)
+        full: Dump everything retained verbatim, cursor-independent (default False = incremental)
+        timestamp: Keep the leading `I (12345) ` ms prefix (default False: stripped)
+        max_lines: Cap on returned lines (0 = no cap, the default)
+        match: Regex filter ('|' separates alternatives, e.g. 'wifi|error')
     """
     sess = _MONITORS.get(session_id)
     if not sess:
@@ -732,13 +731,27 @@ def monitor_read(session_id: str, full: bool = False, timestamp: bool = False, m
             continue  # the reader thread appended mid-iteration (deque raises); at serial rates the retry succeeds immediately
     base = total - len(lines_all)              # absolute line number of the buffer head (= lines evicted by the ring so far)
 
+    # Filter = the caller's pattern (on the prefix-stripped line) OR the critical-log phrases (on the
+    # raw line - their `E (...)` / `^rst:` anchors need the prefix). So a filtered view still carries
+    # every crash/error line even when it matches none of the requested things.
+    pat = None
+    if match.strip():
+        try:
+            pat = re.compile(match, re.IGNORECASE)
+        except re.error as e:
+            return f'Invalid regex {match!r}: {e}'
+
+    def _kept(line):
+        return (pat is not None and pat.search(_strip_ts(line))) or _CRITICAL_LOG_RE.search(line) is not None
+
     if full:
         # Cursor-independent true full dump: emit every line kept in the buffer without advancing the incremental cursor (the two read modes never interfere)
-        shown = lines_all
+        shown = [l for l in lines_all if _kept(l)] if pat else lines_all
         if max_lines > 0 and len(shown) > max_lines:
             shown = shown[-max_lines:]
+        scope = f', {len(shown)} matched' if pat else ''
         header = (f'--- {session_id}: full dump, showing {len(shown)} of {len(lines_all)} retained '
-                  f'lines ({total} total received, {base} evicted by buffer cap); '
+                  f'lines{scope} ({total} total received, {base} evicted by buffer cap); '
                   f'log file: {sess.log_path or "<not enabled>"} ---')
         return os.linesep.join([header] + shown)
 
@@ -746,6 +759,15 @@ def monitor_read(session_id: str, full: bool = False, timestamp: bool = False, m
     new_lines = lines_all[start:]
     evicted = max(base - sess.read_cursor, 0)  # unread lines evicted by the ring buffer
     sess.read_cursor = total
+
+    if pat:
+        shown = [l for l in new_lines if _kept(l)]
+        matched_n = len(shown)
+        notes = f', {evicted} evicted by buffer cap' if evicted else ''
+        if max_lines > 0 and len(shown) > max_lines:
+            notes += f', {len(shown) - max_lines} older skipped (showing last {max_lines})'
+            shown = shown[-max_lines:]
+        return os.linesep.join([f'--- {session_id}: {len(new_lines)} new lines, {matched_n} matched{notes} ---'] + shown)
 
     # Find the app-layer start: fold everything before it, show it and what follows. When the batch has no marker, check whether it is still in the boot phase:
     # boot markers present (not yet past "Returned") -> fold the whole batch; otherwise it is a plain continuation -> show it all
