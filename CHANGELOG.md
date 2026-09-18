@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.5.0 (2026-09-18)
+
+- **Sessions now free their own port** — every session opened by `monitor_open` carries a lightweight watchdog: after `idle_release` seconds (default 30, new per-call parameter) with no `monitor_read`/`monitor_send`, the session stops itself, releases the COM port and leaves the registry. Any read or write resets the timer (sending counts too, so send-then-read gaps do not reap a session mid-work). This fixes the port-stuck failure mode where an MCP client abandons the server process without closing the stdio pipes — the session used to hold the port until the process was killed by hand, and because the read loop re-grabs the port after USB re-enumeration, even unplug/replug did not help. Pass a larger `idle_release` to bridge a long pause; if a call reports `No session`, just `monitor_open` again (full history stays in the log file).
+- **atexit fallback** — on any graceful process exit the server releases every session's port and log file, whatever the client left open.
+
 ## v0.4.1 (2026-09-18)
 
 - **Persistent full serial log per session** — every line the monitor receives is flushed to `<project_dir>/.esp_monitor_full.log` (or a temp-dir file for standalone opens) as it arrives. The ring buffer only holds the recent 20 000 lines, but the file keeps everything: history survives buffer eviction, USB re-enumeration, board resets and session close. Session open, board reset and port re-connect write separator lines into the file; `monitor_open` returns the path.

@@ -1,4 +1,5 @@
 """ESP-IDF MCP server: build, flash and serial monitor tools for ESP-IDF projects."""
+import atexit
 import json
 import os
 import re
@@ -409,6 +410,7 @@ class SerialSession:
         self.error = None
         self.ser = None
         self.thread = None
+        self.last_activity = time.monotonic()  # bumped by monitor_read/monitor_send; the watchdog releases the port when it goes stale
         # Session full log: the ring buffer gets evicted and is cleared on reconnect/reset;
         # only the on-disk file never loses history. Write failures degrade silently (must not take down the reader thread).
         self.log_path = log_path
@@ -590,6 +592,12 @@ def _resolve_console_baud(project_dir: Optional[str] = None) -> int:
 
 # Session-based serial monitor registry: session_id -> SerialSession (maintained by monitor_open/close)
 _MONITORS: dict = {}
+# Default session lifetime: after this long with no monitor_read/monitor_send the session frees its
+# own port. Per-call override via monitor_open(idle_release=...). The MCP client abandons server
+# processes without closing the stdio pipes (observed), and the reader thread re-grabs the port after
+# unplug/replug — without self-release a monitor would hold the COM port until the process is killed
+# by hand.
+_SESSION_IDLE_RELEASE = 30
 
 
 def _serial_ports():
@@ -624,13 +632,37 @@ def _close_monitors_on_port(port):
     return closed
 
 
+def _close_all_monitors():
+    """atexit fallback: on process exit release every session's port and log file, whatever the client left open."""
+    for sid, sess in list(_MONITORS.items()):
+        try:
+            sess.stop()
+        except Exception:
+            pass
+    _MONITORS.clear()
+
+
+def _idle_watchdog(sess, sid, idle_release):
+    """Session-owned lifetime (spawned by monitor_open): release the port once no
+    monitor_read/monitor_send happened for idle_release seconds."""
+    while sess.running and time.monotonic() - sess.last_activity < idle_release:
+        time.sleep(1)
+    if not sess.running:
+        return  # closed externally (monitor_close / flash / atexit) while we slept
+    print(f'[INFO] {sid} idle >{idle_release}s, releasing {sess.port}', file=sys.stderr)
+    sess.stop()
+    _MONITORS.pop(sid, None)
+
+
 @mcp.tool(structured_output=False)
-def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = None) -> str:
+def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = None,
+                 idle_release: float = _SESSION_IDLE_RELEASE) -> str:
     """Open a persistent serial monitor session. Returns immediately (non-blocking).
     Args:
         port: Serial port (e.g. COM14)
         reset: Reset the board after opening (default True) so you capture a fresh boot
         project_dir: Project dir for console baud auto-detect (sdkconfig). flash_project passes it automatically; standalone opens fall back to 115200.
+        idle_release: Seconds without monitor_read/monitor_send before the session auto-releases the port (default 30). Pass a longer value to keep the session across a long pause, or monitor_close explicitly when done.
     """
     baud = _resolve_console_baud(project_dir)
     sid = f'{port}@{baud}'
@@ -652,9 +684,12 @@ def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = Non
     except serial.SerialException as e:
         return f'Failed to open {port}: {e}'
     _MONITORS[sid] = sess
+    threading.Thread(target=_idle_watchdog, args=(sess, sid, idle_release), daemon=True).start()
     return (f'Monitor opened: {sid} (reset={"on" if reset else "off"}). '
             f'Full serial log (every line, survives buffer eviction/reconnect): {log_path}. '
             f'Send input with monitor_send, release with monitor_close. '
+            f'Auto-release: after {idle_release:g}s with no monitor_read/monitor_send the session frees '
+            f'the port — if the session is gone ("No session"), just monitor_open again (history stays in the log file). '
             f'Note: flashing closes existing sessions on the target port before writing, then opens a fresh one; '
             f'read_chip_info auto-closes sessions on the target port; '
             f'monitor_close(session_id) releases a specific session / port.')
@@ -686,6 +721,7 @@ def monitor_read(session_id: str, full: bool = False, timestamp: bool = False, m
     sess = _MONITORS.get(session_id)
     if not sess:
         return f'No session {session_id}. Open one with monitor_open (open sessions: {list(_MONITORS) or "none"}).'
+    sess.last_activity = time.monotonic()
 
     while True:
         total = sess.total  # read the counter before copying the buffer: lines appended during the copy are left for the next read - no loss, no duplication
@@ -747,6 +783,7 @@ def monitor_send(session_id: str, data: str, press_enter: bool = True) -> str:
     sess = _MONITORS.get(session_id)
     if not sess:
         return f'No session {session_id}. Open one with monitor_open (open sessions: {list(_MONITORS) or "none"}).'
+    sess.last_activity = time.monotonic()  # writing counts as activity too, else send-then-read gaps would reap the session mid-work
     try:
         sess.ser.write(data.encode('utf-8') + (b'\r\n' if press_enter else b''))
         return f'Sent to {session_id}: {data!r}'
@@ -814,6 +851,7 @@ def main():
     """Run the MCP server on stdio. Its lifetime follows the client: the process exits when
     the client closes the pipe, and a crash exits too — whether to restart it is the MCP
     client's decision, not ours."""
+    atexit.register(_close_all_monitors)
     try:
         mcp.run()
     except KeyboardInterrupt:
