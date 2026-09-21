@@ -3,6 +3,7 @@ import atexit
 import json
 import os
 import re
+import shlex
 import tempfile
 import subprocess
 import sys
@@ -22,9 +23,15 @@ except ImportError:
 import glob as _glob
 
 
+def _ver_key(path):
+    """Numeric sort key from the digits in a path: 'v10.0' beats 'v5.9', where lexicographic order inverts them.
+    Literal path components are shared by every candidate of one glob, so only the wildcard component decides."""
+    return tuple(int(x) for x in re.findall(r'\d+', path))
+
+
 def _newest(pattern):
     """Newest matching dir for a wildcard path pattern (None if no match)."""
-    matches = sorted(m for m in _glob.glob(pattern) if os.path.isdir(m))
+    matches = sorted((m for m in _glob.glob(pattern) if os.path.isdir(m)), key=_ver_key)
     return matches[-1] if matches else None
 
 
@@ -39,7 +46,7 @@ def _find_idf_path():
         found = [os.path.join(base, v, 'esp-idf') for v in os.listdir(base)
                  if os.path.isfile(os.path.join(base, v, 'esp-idf', 'tools', 'idf.py'))]
         if found:
-            return sorted(found)[-1]  # highest version wins
+            return sorted(found, key=_ver_key)[-1]  # highest version wins (numeric: v10 > v9 > v5.10)
     raise SystemExit('ESP-IDF not found: set IDF_PATH, or install under D:\\esp\\<ver>\\esp-idf')
 
 
@@ -120,17 +127,20 @@ def _kill_tree(proc):
         return
     try:
         if os.name == 'nt':
-            subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            r = subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            if r.returncode != 0:  # leftover orphans would keep the build dir locked - say so instead of failing silently
+                print(f'[WARN] taskkill /PID {proc.pid} failed: '
+                      f'{r.stderr.decode(errors="replace").strip()}', file=sys.stderr)
         else:
             proc.kill()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'[WARN] kill tree for PID {proc.pid} failed: {e}', file=sys.stderr)
 
 
 def _run_sync(cmd, cwd, timeout=600):
     """Run command synchronously; output goes to a unique persistent log file.
-    Returns (returncode, output, log_file). On timeout the whole process tree is killed."""
+    Returns (returncode, output, log_file). On timeout the process tree kill is attempted (failures are logged to stderr)."""
     os.makedirs(_LOG_DIR, exist_ok=True)
     fd, log_file = tempfile.mkstemp(prefix=time.strftime('%Y%m%d_%H%M%S_'), suffix='.log', dir=_LOG_DIR)
     os.close(fd)
@@ -138,10 +148,12 @@ def _run_sync(cmd, cwd, timeout=600):
     try:
         with open(log_file, 'w', encoding='utf-8') as f:
             print(f'Running: {" ".join(cmd)} in {cwd}', file=sys.stderr)
+            env = os.environ.copy()
+            env['PYTHONUTF8'] = '1'  # redirected child stdout uses the locale encoding (cp936 on zh-CN Windows); this log is read back as utf-8 below
             proc = subprocess.Popen(
                 cmd, stdout=f, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                env=os.environ.copy(), cwd=cwd
+                env=env, cwd=cwd
             )
             try:
                 rc = proc.wait(timeout=timeout)
@@ -156,7 +168,7 @@ def _run_sync(cmd, cwd, timeout=600):
             except OSError:
                 pass
         if rc == -1:
-            return -1, f'Timed out after {timeout}s (process tree killed)', log_file
+            return -1, f'Timed out after {timeout}s (process tree kill attempted)', log_file
         return rc, output, log_file
     except Exception as e:
         _kill_tree(proc)
@@ -164,27 +176,41 @@ def _run_sync(cmd, cwd, timeout=600):
 
 
 @mcp.tool(structured_output=False)
-def build_project(project_dir: str, full_log: bool = False) -> str:
+def build_project(project_dir: str, full_log: bool = False, timeout: int = 600) -> str:
     """Build ESP-IDF project via idf.py (same as manual `idf.py build`).
     Args:
         project_dir: Absolute path to the ESP-IDF project directory
         full_log: If True, return the complete build output (no truncation). If False (default), return only the tail of the output.
+        timeout: Max seconds for the whole build (default 600). On timeout the process tree is killed and a failure returned.
     """
-    rc, out, log_file = _run_sync([IDF_PYTHON, _get_idf_py(), '-C', project_dir, 'build'], project_dir)
+    with _BUILD_LOCK:
+        rc, out, log_file = _run_sync([IDF_PYTHON, _get_idf_py(), '-C', project_dir, 'build'], project_dir, timeout=timeout)
     if rc == 0:
         return f'Successfully built project.\n{out if full_log else out[-300:]}'
     else:
         return f'Build failed (exit {rc}): {out if full_log else out[-500:]}{os.linesep}full log: {log_file}'
 
 
+def _esptool_flash_cmd(port):
+    """esptool command line for flashing. esptool 5.x (bundled since IDF v6.0; v5.5 still pins esptool~=4.12)
+    renamed commands and option values to hyphenated spelling but keeps the underscore names as deprecated
+    aliases - so pre-v6 IDF venvs get the underscore forms, which work on every esptool version."""
+    new = tuple(int(x) for x in re.findall(r'\d+', os.environ['ESP_IDF_VERSION'])[:2]) >= (6, 0)
+    return [IDF_PYTHON, '-m', 'esptool', '--port', port,
+            '--before', 'default-reset' if new else 'default_reset',
+            '--after', 'hard-reset' if new else 'hard_reset',
+            'write-flash' if new else 'write_flash']
+
+
 @mcp.tool(structured_output=False)
-def flash_project(project_dir: str, port: Optional[str] = None, monitor: bool = True, wait_after_flash: float = 2.0) -> str:
+def flash_project(project_dir: str, port: Optional[str] = None, monitor: bool = True, wait_after_flash: float = 2.0, timeout: int = 600) -> str:
     """Flash the built project with esptool, then open a monitor session on the port (default).
     Args:
         project_dir: Absolute path to the ESP-IDF project directory
         port: Serial port (e.g. COM13); auto-detected when omitted (only if exactly one non-COM1 port). Monitor sessions on this port are closed before flashing.
         monitor: Open a monitor session after flashing (default True)
         wait_after_flash: Seconds to let the hard-reset boot finish before opening the monitor (default 2.0)
+        timeout: Max seconds for the whole flash (default 600). On timeout the process tree is killed and a failure returned.
     """
     # Pre-flash: auto-detect the port when omitted; once known, close only this port's monitor session (skip if none open)
     if not port:
@@ -195,13 +221,12 @@ def flash_project(project_dir: str, port: Optional[str] = None, monitor: bool = 
     closed_note = f' (auto-closed monitor: {", ".join(closed)})' if closed else ''
     build_dir = os.path.join(project_dir, 'build')
     flash_args_file = os.path.join(build_dir, 'flash_args')
-    cmd = [IDF_PYTHON, '-m', 'esptool', '--port', port, '--before', 'default-reset', '--after', 'hard-reset']
-    cmd.append('write-flash')
+    cmd = _esptool_flash_cmd(port)
     if os.path.exists(flash_args_file):
-        with open(flash_args_file, 'r') as f:
-            args = f.read().strip().split()
-        cmd.extend(args)
-    rc, out, log_file = _run_sync(cmd, build_dir)
+        with open(flash_args_file, 'r', encoding='utf-8') as f:
+            cmd.extend(shlex.split(f.read()))  # same POSIX shlex tokens esptool's @flash_args expansion produces
+    with _BUILD_LOCK:
+        rc, out, log_file = _run_sync(cmd, build_dir, timeout=timeout)
     if rc != 0:
         return f'Flash failed (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
     result = f'Successfully flashed to {port}.{closed_note} {out[-200:]}'
@@ -274,7 +299,8 @@ def read_chip_info(port: str = '', baud: int = 115200) -> str:
             return _no_port_message()
     closed = _close_monitors_on_port(port)
     closed_note = f' (auto-closed monitor: {", ".join(closed)})' if closed else ''
-    rc, out, log_file = _run_sync([IDF_PYTHON, '-c', _CHIP_INFO_SNIPPET, port, str(baud)], tempfile.gettempdir(), timeout=120)
+    with _BUILD_LOCK:
+        rc, out, log_file = _run_sync([IDF_PYTHON, '-c', _CHIP_INFO_SNIPPET, port, str(baud)], tempfile.gettempdir(), timeout=120)
     # esptool connection logs are mixed into the output; take the last JSON line
     json_line = next((l for l in reversed(out.strip().splitlines()) if l.startswith('{')), None)
     if json_line is None:
@@ -307,7 +333,8 @@ def set_target(project_dir: str, target: str) -> str:
         target: Target chip (e.g. esp32, esp32s3, esp32c2)
     """
     cmd = [IDF_PYTHON, _get_idf_py(), 'set-target', target]
-    rc, out, log_file = _run_sync(cmd, project_dir, timeout=120)
+    with _BUILD_LOCK:
+        rc, out, log_file = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
         return (f'Target set to: {target}. Note: idf.py renamed the previous sdkconfig to '
                 f'sdkconfig.old and generated a new one; build_project re-applies '
@@ -330,7 +357,8 @@ def add_dependency(project_dir: str, dependency: str, component: str = 'main', p
         cmd.extend(['--path', path])
     elif component != 'main':
         cmd.extend(['--component', component])
-    rc, out, log_file = _run_sync(cmd, project_dir, timeout=120)
+    with _BUILD_LOCK:
+        rc, out, log_file = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
         return f'Dependency added to manifest: {dependency} (component downloaded on next build)'
     else:
@@ -345,7 +373,8 @@ def remove_dependency(project_dir: str, dependency: str) -> str:
         dependency: Component dependency name (e.g. 'espressif/button', 'button')
     """
     cmd = [IDF_PYTHON, _get_idf_py(), 'remove-dependency', dependency]
-    rc, out, log_file = _run_sync(cmd, project_dir, timeout=120)
+    with _BUILD_LOCK:
+        rc, out, log_file = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
         return f'Dependency removed from manifests: {dependency} (pruned on next build)'
     else:
@@ -361,7 +390,8 @@ def clean_project(project_dir: str, full: bool = False) -> str:
     """
     action = 'fullclean' if full else 'clean'
     cmd = [IDF_PYTHON, _get_idf_py(), action]
-    rc, out, log_file = _run_sync(cmd, project_dir, timeout=120)
+    with _BUILD_LOCK:
+        rc, out, log_file = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
         return f'Project {action} successfully'
     else:
@@ -419,6 +449,7 @@ class SerialSession:
         self.read_cursor = 0  # lines already returned (incremental cursor; full mode does not advance it)
         self.running = True
         self.error = None
+        self._buf_lock = threading.Lock()  # pairs buffer mutations (append/clear) with `total` so monitor_read can snapshot both atomically
         self.ser = None
         self.thread = None
         self.last_activity = time.monotonic()  # bumped by monitor_read/monitor_send; the watchdog releases the port when it goes stale
@@ -449,12 +480,15 @@ class SerialSession:
                 pass
             self._log_fp = None
 
-    def _open_serial(self):
+    def _close_ser(self):
         if self.ser and self.ser.is_open:
             try:
                 self.ser.close()
             except Exception:
                 pass
+
+    def _open_serial(self):
+        self._close_ser()
         self.ser = serial.Serial()
         self.ser.port = self.port
         self.ser.baudrate = self.baud
@@ -505,9 +539,10 @@ class SerialSession:
                     self.ser.reset_input_buffer()
                 except Exception:
                     pass
-                self.buffer.clear()
-                self.read_cursor = 0
-                self.total = 0  # keep in sync with buffer/cursor, otherwise the first read after reset falsely reports evicted
+                with self._buf_lock:
+                    self.buffer.clear()
+                    self.read_cursor = 0
+                    self.total = 0  # keep in sync with buffer/cursor, otherwise the first read after reset falsely reports evicted
                 self._hard_reset()
                 self._log_write('==== board reset ====')
             except serial.SerialException:
@@ -519,8 +554,9 @@ class SerialSession:
             text = _ANSI_RE.sub('', raw.decode('utf-8', errors='replace')).rstrip('\r')
         except Exception:
             text = str(raw)
-        self.buffer.append(text)
-        self.total += 1
+        with self._buf_lock:
+            self.buffer.append(text)
+            self.total += 1
         self._log_write(text)
 
     def _read_loop(self):
@@ -555,9 +591,13 @@ class SerialSession:
                         time.sleep(0.5)  # officially recommended interval
                         reconnect_waited += 0.5
                         self._open_serial()
-                        self.buffer.clear()  # On successful reconnect clear the old logs so only post-reset lines are kept
-                        self.read_cursor = 0
-                        self.total = 0     # keep in sync with buffer/cursor
+                        if not self.running:  # stop() raced the reopen: hand the freshly opened port back instead of holding it forever
+                            self._close_ser()
+                            return
+                        with self._buf_lock:
+                            self.buffer.clear()  # On successful reconnect clear the old logs so only post-reset lines are kept
+                            self.read_cursor = 0
+                            self.total = 0     # keep in sync with buffer/cursor
                         line_buffer = b''  # drop the partial line from before the disconnect so it cannot glue onto reconnected data
                         self._log_write(f'==== port reconnected after {reconnect_waited}s ====')
                         print(f'[INFO] Port {self.port} reconnected after {reconnect_waited}s', file=sys.stderr)
@@ -571,13 +611,10 @@ class SerialSession:
 
     def stop(self):
         self.running = False
-        if self.ser and self.ser.is_open:
-            try:
-                self.ser.close()
-            except Exception:
-                pass
+        self._close_ser()
         if self.thread:
             self.thread.join(timeout=2)
+        self._close_ser()  # the reader may have finished an open() that was in flight during the first close
         if self._log_fp:
             try:
                 self._log_fp.close()
@@ -603,6 +640,10 @@ def _resolve_console_baud(project_dir: Optional[str] = None) -> int:
 
 # Session-based serial monitor registry: session_id -> SerialSession (maintained by monitor_open/close)
 _MONITORS: dict = {}
+# FastMCP runs sync tools on a worker-thread pool, so tool-level state needs explicit locking
+_MONITORS_LOCK = threading.RLock()  # guards _MONITORS check-then-act; RLock: monitor_close calls _close_monitors_on_port while holding it
+# ponytail: one global lock also serializes builds of different projects; upgrade path = a lock dict keyed by project_dir
+_BUILD_LOCK = threading.Lock()
 # Default session lifetime: after this long with no monitor_read/monitor_send the session frees its
 # own port. Per-call override via monitor_open(idle_release=...). The MCP client abandons server
 # processes without closing the stdio pipes (observed), and the reader thread re-grabs the port after
@@ -635,22 +676,24 @@ def _no_port_message() -> str:
 def _close_monitors_on_port(port):
     """Close open monitor sessions on the given port (case-insensitive, no blanket close)."""
     closed = []
-    for sid, sess in list(_MONITORS.items()):
-        if sess.port.upper() == port.strip().upper():
-            sess.stop()
-            _MONITORS.pop(sid, None)
-            closed.append(sid)
+    with _MONITORS_LOCK:
+        for sid, sess in list(_MONITORS.items()):
+            if sess.port.upper() == port.strip().upper():
+                sess.stop()
+                _MONITORS.pop(sid, None)
+                closed.append(sid)
     return closed
 
 
 def _close_all_monitors():
     """atexit fallback: on process exit release every session's port and log file, whatever the client left open."""
-    for sid, sess in list(_MONITORS.items()):
-        try:
-            sess.stop()
-        except Exception:
-            pass
-    _MONITORS.clear()
+    with _MONITORS_LOCK:
+        for sid, sess in list(_MONITORS.items()):
+            try:
+                sess.stop()
+            except Exception:
+                pass
+        _MONITORS.clear()
 
 
 def _idle_watchdog(sess, sid, idle_release):
@@ -661,8 +704,11 @@ def _idle_watchdog(sess, sid, idle_release):
     if not sess.running:
         return  # closed externally (monitor_close / flash / atexit) while we slept
     print(f'[INFO] {sid} idle >{idle_release}s, releasing {sess.port}', file=sys.stderr)
-    sess.stop()
-    _MONITORS.pop(sid, None)
+    with _MONITORS_LOCK:
+        if _MONITORS.get(sid) is not sess:
+            return  # closed and reopened under the same id - the replacement session is not ours to stop
+        sess.stop()
+        _MONITORS.pop(sid, None)
 
 
 @mcp.tool(structured_output=False)
@@ -677,24 +723,28 @@ def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = Non
     """
     baud = _resolve_console_baud(project_dir)
     sid = f'{port}@{baud}'
-    if sid in _MONITORS:
-        return f'Session {sid} is already open — use monitor_send / monitor_close.'
-    open_on_port = [s for s, sess in _MONITORS.items() if sess.port.upper() == port.strip().upper()]
-    if open_on_port:
-        return (f'{port} is already monitored as {", ".join(open_on_port)} — monitor_close it '
-                f'first if you want to reopen with a different baud.')
     # Session full log: into the project root when a project dir is given (.esp_monitor_full.log, easy to find), else into the temp dir
     if project_dir:
         log_path = os.path.join(project_dir, '.esp_monitor_full.log')
     else:
         os.makedirs(_LOG_DIR, exist_ok=True)
         log_path = os.path.join(_LOG_DIR, f'monitor_{port}_{time.strftime("%Y%m%d_%H%M%S")}.log')
-    try:
-        sess = SerialSession(port, baud, log_path=log_path)
-        sess.start(reset=reset)
-    except serial.SerialException as e:
-        return f'Failed to open {port}: {e}'
-    _MONITORS[sid] = sess
+    with _MONITORS_LOCK:  # open/close are check-then-act; tools run concurrently in the FastMCP worker pool
+        if sid in _MONITORS:
+            return f'Session {sid} is already open — use monitor_send / monitor_close.'
+        open_on_port = [s for s, sess in _MONITORS.items() if sess.port.upper() == port.strip().upper()]
+        if open_on_port:
+            return (f'{port} is already monitored as {", ".join(open_on_port)} — monitor_close it '
+                    f'first if you want to reopen with a different baud.')
+        sess = None
+        try:
+            sess = SerialSession(port, baud, log_path=log_path)
+            sess.start(reset=reset)
+        except serial.SerialException as e:
+            if sess:
+                sess.stop()  # release the log file handle opened by __init__ (the serial open failed afterwards)
+            return f'Failed to open {port}: {e}'
+        _MONITORS[sid] = sess
     threading.Thread(target=_idle_watchdog, args=(sess, sid, idle_release), daemon=True).start()
     return (f'Monitor opened: {sid} (reset={"on" if reset else "off"}); full log: {log_path}. '
             f'Idle >{idle_release:g}s auto-releases the port - reopen if the session is gone.')
@@ -722,13 +772,9 @@ def monitor_read(session_id: str, full: bool = False, timestamp: bool = False, m
         return f'No session {session_id}. Open one with monitor_open (open sessions: {list(_MONITORS) or "none"}).'
     sess.last_activity = time.monotonic()
 
-    while True:
-        total = sess.total  # read the counter before copying the buffer: lines appended during the copy are left for the next read - no loss, no duplication
-        try:
-            lines_all = list(sess.buffer)
-            break
-        except RuntimeError:
-            continue  # the reader thread appended mid-iteration (deque raises); at serial rates the retry succeeds immediately
+    with sess._buf_lock:  # snapshot counter and buffer atomically; a line appended mid-copy would shift `base` and silently drop head lines
+        total = sess.total
+        lines_all = list(sess.buffer)
     base = total - len(lines_all)              # absolute line number of the buffer head (= lines evicted by the ring so far)
 
     # Filter = the caller's pattern (on the prefix-stripped line) OR the critical-log phrases (on the
@@ -736,6 +782,10 @@ def monitor_read(session_id: str, full: bool = False, timestamp: bool = False, m
     # every crash/error line even when it matches none of the requested things.
     pat = None
     if match.strip():
+        # ponytail: the length cap only bounds pattern size - a short pattern can still backtrack
+        # catastrophically; real fix = compile+search precheck in a subprocess with a timeout
+        if len(match) > 200:
+            return 'Invalid match: pattern too long (max 200 chars).'
         try:
             pat = re.compile(match, re.IGNORECASE)
         except re.error as e:
@@ -755,10 +805,11 @@ def monitor_read(session_id: str, full: bool = False, timestamp: bool = False, m
                   f'log file: {sess.log_path or "<not enabled>"} ---')
         return os.linesep.join([header] + shown)
 
-    start = max(sess.read_cursor - base, 0)
-    new_lines = lines_all[start:]
-    evicted = max(base - sess.read_cursor, 0)  # unread lines evicted by the ring buffer
-    sess.read_cursor = total
+    with sess._buf_lock:  # cursor read+advance atomic: concurrent reads could roll it back to a stale value and re-serve old lines
+        start = max(sess.read_cursor - base, 0)
+        new_lines = lines_all[start:]
+        evicted = max(base - sess.read_cursor, 0)  # unread lines evicted by the ring buffer
+        sess.read_cursor = total
 
     if pat:
         shown = [l for l in new_lines if _kept(l)]
@@ -820,15 +871,17 @@ def monitor_close(session_id: str) -> str:
         session_id: Session id from monitor_open (e.g. 'COM14@74880'), or a bare port ('COM14') to close all sessions on that port.
     """
     target = session_id.strip()
-    sid = next((s for s in _MONITORS if s.upper() == target.upper()), None)
-    if sid:
-        sess = _MONITORS.pop(sid)
-        sess.stop()
-        return f'Monitor closed: {sid}. Port {sess.port} released.'
-    closed = _close_monitors_on_port(target)  # match by port name ('COM14' -> 'COM14@74880')
+    with _MONITORS_LOCK:
+        sid = next((s for s in _MONITORS if s.upper() == target.upper()), None)
+        if sid:
+            sess = _MONITORS.pop(sid)
+            sess.stop()
+            return f'Monitor closed: {sid}. Port {sess.port} released.'
+        closed = _close_monitors_on_port(target)  # match by port name ('COM14' -> 'COM14@74880')
+        open_now = list(_MONITORS)
     if closed:
         return f'Monitor sessions closed on {target}: {", ".join(closed)}.'
-    return f'No session {target} (open sessions: {list(_MONITORS) or "none"}).'
+    return f'No session {target} (open sessions: {open_now or "none"}).'
 
 
 @mcp.tool(structured_output=False)
@@ -850,7 +903,8 @@ def run_pytest(project_dir: str, test_path: str = 'pytest', target: str = '', po
         cmd.extend(['--port', port])
     if extra_args:
         cmd.extend(extra_args.split())
-    rc, out, log_file = _run_sync(cmd, project_dir, timeout=timeout)
+    with _BUILD_LOCK:
+        rc, out, log_file = _run_sync(cmd, project_dir, timeout=timeout)
     tail = out if len(out) < 4000 else out[-4000:]
     if rc == 0:
         return f'All tests passed ({len(out)} bytes output):{os.linesep}{tail}'
