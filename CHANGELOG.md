@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.7.1 (2026-09-25)
+
+- **Idle-release default raised 30 s → 120 s** — half a minute reaped sessions mid-debugging: any pause longer than that between `monitor_read` calls freed the COM port and the next read reported `No session`. `monitor_open(idle_release=…)` remains the per-call override; any read or write still resets the timer.
+- **Session full log rewritten at every open** — `.esp_monitor_full.log` used to append forever across sessions (observed in the wild: 73 sessions / 950 KB in one file), so greps for `assert failed` or `Rebooting` kept hitting stale evidence from long-gone sessions. Every `monitor_open` now starts the file from scratch; within a session the behavior is unchanged (every line flushed as it arrives — history survives buffer eviction, re-connects and board resets).
+
 ## v0.7.0 (2026-09-22)
 
 - **Caller-tunable timeouts** — `build_project` and `flash_project` now expose a `timeout` parameter (default 600 s, the previous hardcoded limit), so the agent can size the deadline to the job (full clean build vs incremental) without touching client config. `run_pytest` already worked this way. The server-side timeout remains the only authoritative deadline: when it fires, the whole process tree is killed and a normal failure result (with the log path) is returned.

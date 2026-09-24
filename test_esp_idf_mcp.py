@@ -57,6 +57,18 @@ try:
 finally:
     m._MONITORS.pop(sid, None)
 
+# session log: every session rewrites the file from scratch - no cross-session accumulation
+import tempfile as _tempfile
+_log = os.path.join(_tempfile.mkdtemp(), '.esp_monitor_full.log')
+s1 = m.SerialSession('COMT', 115200, log_path=_log)
+s1._append_line(b'old crash line')
+s1.stop()
+s2 = m.SerialSession('COMT', 115200, log_path=_log)
+s2._append_line(b'fresh line')
+s2.stop()
+content = open(_log, encoding='utf-8').read()
+assert 'old crash line' not in content and 'fresh line' in content, content
+
 sess.stop()  # never-started session (no thread, no port) must stop cleanly
 
 # build/flash expose a caller-tunable timeout that reaches _run_sync

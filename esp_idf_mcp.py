@@ -459,7 +459,9 @@ class SerialSession:
         self._log_fp = None
         if log_path:
             try:
-                self._log_fp = open(log_path, 'a', encoding='utf-8', errors='replace')
+                # 'w': every session rewrites the file from scratch - earlier sessions' crashes and
+                # reboots must not pollute greps on this file
+                self._log_fp = open(log_path, 'w', encoding='utf-8', errors='replace')
                 self._log_fp.write(f'==== monitor session {port}@{baud} opened '
                                    f'{time.strftime("%Y-%m-%d %H:%M:%S")} ====\n')
                 self._log_fp.flush()
@@ -649,7 +651,7 @@ _BUILD_LOCK = threading.Lock()
 # processes without closing the stdio pipes (observed), and the reader thread re-grabs the port after
 # unplug/replug — without self-release a monitor would hold the COM port until the process is killed
 # by hand.
-_SESSION_IDLE_RELEASE = 30
+_SESSION_IDLE_RELEASE = 120
 
 
 def _serial_ports():
@@ -718,8 +720,8 @@ def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = Non
     Args:
         port: Serial port (e.g. COM14)
         reset: Hard-reset the board after opening, so the session captures a fresh boot (default True)
-        project_dir: Project dir for baud auto-detect (sdkconfig); the session full log goes to its .esp_monitor_full.log
-        idle_release: Seconds without monitor_read/monitor_send before the session auto-releases the port (default 30). Reopen if a call reports "No session".
+        project_dir: Project dir for baud auto-detect (sdkconfig); the session full log goes to its .esp_monitor_full.log (rewritten fresh on every session open)
+        idle_release: Seconds without monitor_read/monitor_send before the session auto-releases the port (default 120). Reopen if a call reports "No session".
     """
     baud = _resolve_console_baud(project_dir)
     sid = f'{port}@{baud}'
