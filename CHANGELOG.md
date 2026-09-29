@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.7.2 (2026-09-29)
+
+- **Build and flash logs live in the project** — every `build_project` run writes `<project_dir>/.esp_build.log`, every `flash_project` run `<project_dir>/.esp_flash.log`; both are rewritten from scratch each time and their paths are stated in the tool docs, so the agent can read the complete output directly. Previously both landed in the MCP temp dir — where a lexicographic pruning bug evicted every tool log in favor of ancient monitor logs (observed in the wild: zero tool logs left, week-old monitor logs kept), which is why build logs were effectively unfindable.
+- **The MCP temp dir no longer accumulates anything** — tools without a project context (chip-info, set-target, dependency management, clean, pytest) write a transient log that is deleted immediately after the call, and standalone monitor sessions (no project dir) keep no full-log file at all; legacy files are wiped at server startup. Failure messages only ever point at logs that actually exist.
+- **Timeout messages carry the output tail** — the last 500 lines collected before the process tree kill are included, so a timed-out call still shows where it was stuck even when no persistent log exists.
+
 ## v0.7.1 (2026-09-25)
 
 - **Idle-release default raised 30 s → 120 s** — half a minute reaped sessions mid-debugging: any pause longer than that between `monitor_read` calls freed the COM port and the next read reported `No session`. `monitor_open(idle_release=…)` remains the per-call override; any read or write still resets the timer.

@@ -115,9 +115,15 @@ def _get_idf_py():
     return os.path.join(os.environ['IDF_PATH'], 'tools', 'idf.py')
 
 
-### Persistent logs: one file per call, no cross-talk, kept for later inspection; only the newest _LOG_KEEP are retained ###
+### Tool logs: build/flash write into the project (.esp_build.log / .esp_flash.log, rewritten every run);
+### tools without a project use a transient temp file deleted right after - this dir never accumulates files.
 _LOG_DIR = os.path.join(tempfile.gettempdir(), 'esp-idf-mcp-logs')
-_LOG_KEEP = 20
+# Wipe what older versions left behind (persistent project logs did not exist before)
+for _stale in _glob.glob(os.path.join(_LOG_DIR, '*.log')):
+    try:
+        os.remove(_stale)
+    except OSError:
+        pass
 
 
 def _kill_tree(proc):
@@ -138,15 +144,21 @@ def _kill_tree(proc):
         print(f'[WARN] kill tree for PID {proc.pid} failed: {e}', file=sys.stderr)
 
 
-def _run_sync(cmd, cwd, timeout=600):
-    """Run command synchronously; output goes to a unique persistent log file.
-    Returns (returncode, output, log_file). On timeout the process tree kill is attempted (failures are logged to stderr)."""
-    os.makedirs(_LOG_DIR, exist_ok=True)
-    fd, log_file = tempfile.mkstemp(prefix=time.strftime('%Y%m%d_%H%M%S_'), suffix='.log', dir=_LOG_DIR)
-    os.close(fd)
+def _run_sync(cmd, cwd, timeout=600, log_file=None):
+    """Run command synchronously. With log_file, output lands there - rewritten every run, so the
+    project keeps exactly one log per tool; without it a transient temp file is used and deleted
+    right after (the MCP temp dir never accumulates files).
+    Returns (returncode, output, log_file) - log_file is None for transient runs.
+    On timeout the process tree kill is attempted (failures are logged to stderr)."""
+    if log_file:
+        path = log_file  # no makedirs: a missing project dir must surface as an error, not be created
+    else:
+        os.makedirs(_LOG_DIR, exist_ok=True)
+        fd, path = tempfile.mkstemp(prefix=time.strftime('%Y%m%d_%H%M%S_'), suffix='.log', dir=_LOG_DIR)
+        os.close(fd)
     proc = None
     try:
-        with open(log_file, 'w', encoding='utf-8') as f:
+        with open(path, 'w', encoding='utf-8') as f:
             print(f'Running: {" ".join(cmd)} in {cwd}', file=sys.stderr)
             env = os.environ.copy()
             env['PYTHONUTF8'] = '1'  # redirected child stdout uses the locale encoding (cp936 on zh-CN Windows); this log is read back as utf-8 below
@@ -160,35 +172,46 @@ def _run_sync(cmd, cwd, timeout=600):
             except subprocess.TimeoutExpired:
                 _kill_tree(proc)
                 rc = -1
-        with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
             output = f.read()
-        for old in sorted(_glob.glob(os.path.join(_LOG_DIR, '*.log')))[:-_LOG_KEEP]:
+        if not log_file:
             try:
-                os.remove(old)
+                os.remove(path)
             except OSError:
                 pass
         if rc == -1:
-            return -1, f'Timed out after {timeout}s (process tree kill attempted)', log_file
-        return rc, output, log_file
+            return -1, f'Timed out after {timeout}s (process tree kill attempted){os.linesep}{output[-500:]}', log_file
+        return rc, output, log_file  # log_file is None for transient runs - the returned output carries everything there was
     except Exception as e:
         _kill_tree(proc)
-        return -1, f'{e}', log_file
+        if not log_file:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return -1, f'{e}', log_file if log_file and os.path.exists(path) else None
+
+
+def _log_note(log_file):
+    """Failure-message suffix pointing at the persistent log; transient runs have none (their output is in the message itself)."""
+    return f'{os.linesep}full log: {log_file}' if log_file else ''
 
 
 @mcp.tool(structured_output=False)
 def build_project(project_dir: str, full_log: bool = False, timeout: int = 600) -> str:
-    """Build ESP-IDF project via idf.py (same as manual `idf.py build`).
+    """Build ESP-IDF project via idf.py (same as manual `idf.py build`). Full output always lands in project_dir/.esp_build.log (rewritten every run).
     Args:
         project_dir: Absolute path to the ESP-IDF project directory
         full_log: If True, return the complete build output (no truncation). If False (default), return only the tail of the output.
         timeout: Max seconds for the whole build (default 600). On timeout the process tree is killed and a failure returned.
     """
     with _BUILD_LOCK:
-        rc, out, log_file = _run_sync([IDF_PYTHON, _get_idf_py(), '-C', project_dir, 'build'], project_dir, timeout=timeout)
-    if rc == 0:
-        return f'Successfully built project.\n{out if full_log else out[-300:]}'
-    else:
-        return f'Build failed (exit {rc}): {out if full_log else out[-500:]}{os.linesep}full log: {log_file}'
+        rc, out, log_file = _run_sync([IDF_PYTHON, _get_idf_py(), '-C', project_dir, 'build'], project_dir, timeout=timeout,
+                                      log_file=os.path.join(project_dir, '.esp_build.log'))
+        if rc == 0:
+            return f'Successfully built project.\n{out if full_log else out[-300:]}'
+        else:
+            return f'Build failed (exit {rc}): {out if full_log else out[-500:]}{_log_note(log_file)}'
 
 
 def _esptool_flash_cmd(port):
@@ -204,7 +227,7 @@ def _esptool_flash_cmd(port):
 
 @mcp.tool(structured_output=False)
 def flash_project(project_dir: str, port: Optional[str] = None, monitor: bool = True, wait_after_flash: float = 2.0, timeout: int = 600) -> str:
-    """Flash the built project with esptool, then open a monitor session on the port (default).
+    """Flash the built project with esptool, then open a monitor session on the port (default). Full output always lands in project_dir/.esp_flash.log (rewritten every run).
     Args:
         project_dir: Absolute path to the ESP-IDF project directory
         port: Serial port (e.g. COM13); auto-detected when omitted (only if exactly one non-COM1 port). Monitor sessions on this port are closed before flashing.
@@ -226,9 +249,9 @@ def flash_project(project_dir: str, port: Optional[str] = None, monitor: bool = 
         with open(flash_args_file, 'r', encoding='utf-8') as f:
             cmd.extend(shlex.split(f.read()))  # same POSIX shlex tokens esptool's @flash_args expansion produces
     with _BUILD_LOCK:
-        rc, out, log_file = _run_sync(cmd, build_dir, timeout=timeout)
+        rc, out, log_file = _run_sync(cmd, build_dir, timeout=timeout, log_file=os.path.join(project_dir, '.esp_flash.log'))
     if rc != 0:
-        return f'Flash failed (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
+        return f'Flash failed (exit {rc}): {out[-500:]}{_log_note(log_file)}'
     result = f'Successfully flashed to {port}.{closed_note} {out[-200:]}'
     # After flashing, open a persistent monitor session (reset=True: the board is reset, so the session only holds the fresh boot log),
     # and return immediately; release it with monitor_close when done.
@@ -304,7 +327,7 @@ def read_chip_info(port: str = '', baud: int = 115200) -> str:
     # esptool connection logs are mixed into the output; take the last JSON line
     json_line = next((l for l in reversed(out.strip().splitlines()) if l.startswith('{')), None)
     if json_line is None:
-        return f'Failed to read chip info on {port} (exit {rc}):{closed_note}{os.linesep}{out[-500:]}{os.linesep}full log: {log_file}'
+        return f'Failed to read chip info on {port} (exit {rc}):{closed_note}{os.linesep}{out[-500:]}{_log_note(log_file)}'
     info = json.loads(json_line)
     if 'error' in info:
         return f'Failed to read chip info on {port}:{closed_note}{os.linesep}{info["error"]}'
@@ -340,7 +363,7 @@ def set_target(project_dir: str, target: str) -> str:
                 f'sdkconfig.old and generated a new one; build_project re-applies '
                 f'sdkconfig.defaults, so keep project settings there.')
     else:
-        return f'Failed to set target (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
+        return f'Failed to set target (exit {rc}): {out[-500:]}{_log_note(log_file)}'
 
 
 @mcp.tool(structured_output=False)
@@ -362,7 +385,7 @@ def add_dependency(project_dir: str, dependency: str, component: str = 'main', p
     if rc == 0:
         return f'Dependency added to manifest: {dependency} (component downloaded on next build)'
     else:
-        return f'Failed to add dependency (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
+        return f'Failed to add dependency (exit {rc}): {out[-500:]}{_log_note(log_file)}'
 
 
 @mcp.tool(structured_output=False)
@@ -378,7 +401,7 @@ def remove_dependency(project_dir: str, dependency: str) -> str:
     if rc == 0:
         return f'Dependency removed from manifests: {dependency} (pruned on next build)'
     else:
-        return f'Failed to remove dependency (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
+        return f'Failed to remove dependency (exit {rc}): {out[-500:]}{_log_note(log_file)}'
 
 
 @mcp.tool(structured_output=False)
@@ -395,7 +418,7 @@ def clean_project(project_dir: str, full: bool = False) -> str:
     if rc == 0:
         return f'Project {action} successfully'
     else:
-        return f'Clean failed (exit {rc}): {out[-500:]}{os.linesep}full log: {log_file}'
+        return f'Clean failed (exit {rc}): {out[-500:]}{_log_note(log_file)}'
 
 
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')  # ANSI escapes from colored ESP_LOG output - pure noise for the agent
@@ -468,6 +491,7 @@ class SerialSession:
             except OSError as e:
                 print(f'[WARN] monitor log file {log_path} unavailable: {e}', file=sys.stderr)
                 self._log_fp = None
+                self.log_path = None  # keep every "full log" mention consistent with reality
 
     def _log_write(self, text):
         if not self._log_fp:
@@ -720,17 +744,17 @@ def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = Non
     Args:
         port: Serial port (e.g. COM14)
         reset: Hard-reset the board after opening, so the session captures a fresh boot (default True)
-        project_dir: Project dir for baud auto-detect (sdkconfig); the session full log goes to its .esp_monitor_full.log (rewritten fresh on every session open)
+        project_dir: Project dir for baud auto-detect (sdkconfig); the session full log goes to its .esp_monitor_full.log (rewritten fresh on every session open; standalone opens without a project dir keep no full-log file)
         idle_release: Seconds without monitor_read/monitor_send before the session auto-releases the port (default 120). Reopen if a call reports "No session".
     """
     baud = _resolve_console_baud(project_dir)
     sid = f'{port}@{baud}'
-    # Session full log: into the project root when a project dir is given (.esp_monitor_full.log, easy to find), else into the temp dir
+    # Session full log: into the project root when a project dir is given (.esp_monitor_full.log, easy to find);
+    # standalone opens (no project) keep no full-log file - the ring buffer is all they have
     if project_dir:
         log_path = os.path.join(project_dir, '.esp_monitor_full.log')
     else:
-        os.makedirs(_LOG_DIR, exist_ok=True)
-        log_path = os.path.join(_LOG_DIR, f'monitor_{port}_{time.strftime("%Y%m%d_%H%M%S")}.log')
+        log_path = None
     with _MONITORS_LOCK:  # open/close are check-then-act; tools run concurrently in the FastMCP worker pool
         if sid in _MONITORS:
             return f'Session {sid} is already open — use monitor_send / monitor_close.'
@@ -748,7 +772,8 @@ def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = Non
             return f'Failed to open {port}: {e}'
         _MONITORS[sid] = sess
     threading.Thread(target=_idle_watchdog, args=(sess, sid, idle_release), daemon=True).start()
-    return (f'Monitor opened: {sid} (reset={"on" if reset else "off"}); full log: {log_path}. '
+    log_note = f'; full log: {log_path}' if log_path else '; no project dir - no full log'
+    return (f'Monitor opened: {sid} (reset={"on" if reset else "off"}){log_note}. '
             f'Idle >{idle_release:g}s auto-releases the port - reopen if the session is gone.')
 
 
@@ -759,7 +784,7 @@ def monitor_read(session_id: str, full: bool = False, timestamp: bool = False, m
     Default: incremental view - boot output before `app_main` is folded into a count, duplicate
     lines collapse to `line  *N`; the header reports counts and evictions.
     full=True: verbatim dump of everything retained in the buffer, without advancing the cursor
-    (evicted lines and full history live in the log file from monitor_open).
+    (evicted lines and full history live in the monitor log file from monitor_open, when enabled).
     match: case-insensitive regex on the line text, '|' for several alternatives ('wifi|error');
     crash/error lines (E-level logs, panics, backtraces, reset reasons) always pass through.
     Args:
@@ -910,7 +935,7 @@ def run_pytest(project_dir: str, test_path: str = 'pytest', target: str = '', po
     tail = out if len(out) < 4000 else out[-4000:]
     if rc == 0:
         return f'All tests passed ({len(out)} bytes output):{os.linesep}{tail}'
-    return f'Tests failed / errored (exit {rc}):{os.linesep}{tail}{os.linesep}full log: {log_file}'
+    return f'Tests failed / errored (exit {rc}):{os.linesep}{tail}{_log_note(log_file)}'
 
 
 # === RESOURCES ===
