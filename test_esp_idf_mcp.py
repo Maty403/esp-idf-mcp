@@ -72,11 +72,11 @@ assert 'old crash line' not in content and 'fresh line' in content, content
 # _run_sync: a given log_file is rewritten every run; without one the temp log is transient (deleted, returns None)
 _pdir = _tempfile.mkdtemp()
 _plog = os.path.join(_pdir, '.esp_build.log')
-rc, out, lf = m._run_sync(['cmd', '/c', 'echo build-one'], _pdir, timeout=30, log_file=_plog)
-assert rc == 0 and 'build-one' in out and 'build-one' in open(_plog, encoding='utf-8').read(), (rc, out)
+rc, out, lf, el = m._run_sync(['cmd', '/c', 'echo build-one'], _pdir, timeout=30, log_file=_plog)
+assert rc == 0 and 'build-one' in out and el >= 0 and 'build-one' in open(_plog, encoding='utf-8').read(), (rc, out)
 m._run_sync(['cmd', '/c', 'echo build-two'], _pdir, timeout=30, log_file=_plog)
 assert 'build-one' not in open(_plog, encoding='utf-8').read()  # rewritten from scratch
-rc, out, tlf = m._run_sync(['cmd', '/c', 'echo transient'], _tempfile.mkdtemp(), timeout=30)
+rc, out, tlf, el = m._run_sync(['cmd', '/c', 'echo transient'], _tempfile.mkdtemp(), timeout=30)
 assert rc == 0 and 'transient' in out and tlf is None, (rc, out, tlf)
 _dir = m._LOG_DIR
 before = set(os.listdir(_dir)) if os.path.isdir(_dir) else set()
@@ -87,10 +87,17 @@ assert not (after - before), after - before  # the transient temp log left nothi
 # timeout: rc=-1, message says so (with output tail), transient temp log still cleaned up
 _tdir = _tempfile.mkdtemp()
 _tbefore = set(os.listdir(m._LOG_DIR)) if os.path.isdir(m._LOG_DIR) else set()
-rc, out, tlf = m._run_sync(['cmd', '/c', 'ping', '-n', '5', '127.0.0.1'], _tdir, timeout=1)
-assert rc == -1 and 'Timed out' in out and tlf is None, (rc, out[:200], tlf)
+rc, out, tlf, el = m._run_sync(['cmd', '/c', 'ping', '-n', '5', '127.0.0.1'], _tdir, timeout=1)
+assert rc == -1 and 'Timed out' in out and tlf is None and el >= 1, (rc, out[:200], tlf)
 _tafter = set(os.listdir(m._LOG_DIR)) if os.path.isdir(m._LOG_DIR) else set()
 assert not (_tafter - _tbefore), _tafter - _tbefore
+
+# verdict helpers: tail snaps to line start; reason extracts error-looking lines
+assert m._tail('A' * 60 + '\n' + 'B' * 50, 70) == 'B' * 50
+_r = m._reason('step1 ok\nerror: boom\nninja: build stopped: subcommand failed.')
+assert 'error: boom' in _r and 'ninja' in _r and 'step1' not in _r
+rc, out, xlf, el = m._run_sync([sys.executable, '-c', "print('error: boom'); raise SystemExit(2)"], _tempfile.mkdtemp(), timeout=30)
+assert rc == 2 and el >= 0 and 'boom' in m._reason(out), (rc, out, el)
 
 sess.stop()  # never-started session (no thread, no port) must stop cleanly
 
