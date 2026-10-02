@@ -1,5 +1,6 @@
 # esp-idf-mcp
 
+![License](https://img.shields.io/badge/license-MIT-green) ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Python](https://img.shields.io/badge/python-3.9%2B-blue) ![Protocol](https://img.shields.io/badge/protocol-Model%20Context%20Protocol-purple)
 
 A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that lets AI agents build, flash, and monitor **ESP-IDF** projects on real hardware — end to end, from source code to boot logs.
 
@@ -119,7 +120,22 @@ read_chip_info → set_target(esp32s3) → build_project → flash_project(port=
 → monitor_read(session_id) → iterate on code → run_pytest
 ```
 
+## Support
+
+If this server saves you flashing-debugging loops, leave a star — or buy the author a coffee:
+
+| Alipay | Binance Pay |
+| :---: | :---: |
+| <img src=".github/assets/reward_alipay.jpg" width="220"> | <img src=".github/assets/reward_binance_pay.png" width="220"> |
+| [Scan to pay](https://qr.alipay.com/tsx16565gbtfpahg1korif1) | [Scan in the Binance app](https://app.binance.com/uni-qr/JmgBCLce) |
+
+| USDT (TRC-20) | USDT (BEP-20 / BSC) |
+| :---: | :---: |
+| <img src=".github/assets/reward_usdt_trc20.png" width="220"> | <img src=".github/assets/reward_usdt.png" width="220"> |
+| Scan, or copy the address:<br>`TL4j1mRbfjQBEGpqBbRTEYHvJABxCi3tkQ` | Scan, or copy the address:<br>`0x1572a9a6ce3da8b55c6cfc67e5b0557f3f10d423` |
+
+> USDT: send on **BSC / BEP-20** only — scan the address with any EVM wallet, or copy it directly.
+
 ## License
 
 [MIT](LICENSE)
-                                                                      ——————反方向的K
