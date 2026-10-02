@@ -182,7 +182,7 @@ def _run_sync(cmd, cwd, timeout=600, log_file=None):
                 pass
         elapsed = time.monotonic() - t0
         if rc == -1:
-            return -1, f'Timed out after {timeout}s (process tree kill attempted). Last errors:{os.linesep}{_reason(output)}', log_file, elapsed
+            return -1, f'⏱ TIMED OUT after {timeout}s (process tree killed). Last errors:{os.linesep}{_reason(output)}', log_file, elapsed
         return rc, output, log_file, elapsed  # log_file is None for transient runs - the returned output carries everything there was
     except Exception as e:
         _kill_tree(proc)
@@ -209,7 +209,9 @@ def _tail(output, limit=300):
         return output
     tail = output[-limit:]
     nl = tail.find('\n')
-    return tail[nl + 1:] if nl != -1 else tail
+    if nl == -1:
+        return tail
+    return tail[nl + 1:] or tail  # a trailing newline would snap to an empty string - keep the unaligned tail instead
 
 
 def _reason(output, max_lines=5):
@@ -220,18 +222,19 @@ def _reason(output, max_lines=5):
 
 
 @mcp.tool(structured_output=False)
-def build_project(project_dir: str, full_log: bool = False, timeout: int = 600) -> str:
+def build_project(project_dir: str, timeout: int = 600) -> str:
     """Build ESP-IDF project via idf.py (same as manual `idf.py build`). Full output always lands in project_dir/.esp_build.log (rewritten every run).
     Args:
         project_dir: Absolute path to the ESP-IDF project directory
-        full_log: If True, return the complete build output (no truncation). If False (default), return only the tail of the output.
         timeout: Max seconds for the whole build (default 600). On timeout the process tree is killed and a failure returned.
     """
     with _BUILD_LOCK:
         rc, out, log_file, elapsed = _run_sync([IDF_PYTHON, _get_idf_py(), '-C', project_dir, 'build'], project_dir, timeout=timeout,
                                                log_file=os.path.join(project_dir, '.esp_build.log'))
         if rc == 0:
-            return f'✅ Build OK in {elapsed:.0f}s.\n' + (out if full_log else _tail(out))
+            return f'✅ Build OK in {elapsed:.0f}s.\n' + _tail(out)
+        if rc == -1:
+            return out + _log_note(log_file)  # timeout: out already carries the verdict and extracted errors
         return (f'❌ Build FAILED (exit {rc}, {elapsed:.0f}s). Last errors:{os.linesep}'
                 f'{_reason(out)}{_log_note(log_file)}')
 
@@ -272,10 +275,12 @@ def flash_project(project_dir: str, port: Optional[str] = None, monitor: bool = 
             cmd.extend(shlex.split(f.read()))  # same POSIX shlex tokens esptool's @flash_args expansion produces
     with _BUILD_LOCK:
         rc, out, log_file, elapsed = _run_sync(cmd, build_dir, timeout=timeout, log_file=os.path.join(project_dir, '.esp_flash.log'))
+        if rc == -1:
+            return out + _log_note(log_file)  # timeout: message already composed
         if rc != 0:
             return (f'❌ Flash FAILED (exit {rc}, {elapsed:.0f}s). Last errors:{os.linesep}'
                     f'{_reason(out)}{_log_note(log_file)}')
-    result = f'✅ Flashed to {port} in {elapsed:.0f}s.{closed_note} {out[-200:]}'
+    result = f'✅ Flashed to {port} in {elapsed:.0f}s.{closed_note}'
     # After flashing, open a persistent monitor session (reset=True: the board is reset, so the session only holds the fresh boot log),
     # and return immediately; release it with monitor_close when done.
     if monitor:
@@ -348,13 +353,15 @@ def read_chip_info(port: str = '', baud: int = 115200) -> str:
     with _BUILD_LOCK:
         rc, out, log_file, elapsed = _run_sync([IDF_PYTHON, '-c', _CHIP_INFO_SNIPPET, port, str(baud)], tempfile.gettempdir(), timeout=120)
     # esptool connection logs are mixed into the output; take the last JSON line
+    if rc == -1:
+        return f'❌ Chip info on {port}{closed_note}: ' + out + _log_note(log_file)
     json_line = next((l for l in reversed(out.strip().splitlines()) if l.startswith('{')), None)
     if json_line is None:
-        return f'❌ Chip info FAILED on {port}{closed_note} (exit {rc}). Last errors:{os.linesep}{_reason(out)}{_log_note(log_file)}'
+        return f'❌ Chip info FAILED on {port}{closed_note} (exit {rc}, {elapsed:.0f}s). Last errors:{os.linesep}{_reason(out)}{_log_note(log_file)}'
     info = json.loads(json_line)
     if 'error' in info:
         return f'Failed to read chip info on {port}:{closed_note}{os.linesep}{info["error"]}'
-    lines = [f'✅ Chip info for {port}{closed_note}:',
+    lines = [f'✅ Chip info for {port}{closed_note} in {elapsed:.0f}s:',
              f'  chip:         {info.get("chip", "?")}']
     for key, label in [('chip_revision', 'revision:     '), ('features', 'features:     '),
                        ('crystal_freq_mhz', 'crystal:      '), ('mac', 'MAC:          '),
@@ -385,8 +392,9 @@ def set_target(project_dir: str, target: str) -> str:
         return (f'✅ Target set to: {target} in {elapsed:.0f}s. Note: idf.py renamed the previous sdkconfig to '
                 f'sdkconfig.old and generated a new one; build_project re-applies '
                 f'sdkconfig.defaults, so keep project settings there.')
-    else:
-        return f'❌ set-target FAILED (exit {rc}, {elapsed:.0f}s). Last errors:{os.linesep}{_reason(out)}{_log_note(log_file)}'
+    if rc == -1:
+        return out + _log_note(log_file)
+    return f'❌ set-target FAILED (exit {rc}, {elapsed:.0f}s). Last errors:{os.linesep}{_reason(out)}{_log_note(log_file)}'
 
 
 @mcp.tool(structured_output=False)
@@ -407,8 +415,9 @@ def add_dependency(project_dir: str, dependency: str, component: str = 'main', p
         rc, out, log_file, elapsed = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
         return f'✅ Dependency added to manifest: {dependency} in {elapsed:.0f}s (component downloaded on next build)'
-    else:
-        return f'❌ add-dependency FAILED (exit {rc}, {elapsed:.0f}s). Last errors:{os.linesep}{_reason(out)}{_log_note(log_file)}'
+    if rc == -1:
+        return out + _log_note(log_file)
+    return f'❌ add-dependency FAILED (exit {rc}, {elapsed:.0f}s). Last errors:{os.linesep}{_reason(out)}{_log_note(log_file)}'
 
 
 @mcp.tool(structured_output=False)
@@ -423,8 +432,9 @@ def remove_dependency(project_dir: str, dependency: str) -> str:
         rc, out, log_file, elapsed = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
         return f'✅ Dependency removed from manifests: {dependency} in {elapsed:.0f}s (pruned on next build)'
-    else:
-        return f'❌ remove-dependency FAILED (exit {rc}, {elapsed:.0f}s). Last errors:{os.linesep}{_reason(out)}{_log_note(log_file)}'
+    if rc == -1:
+        return out + _log_note(log_file)
+    return f'❌ remove-dependency FAILED (exit {rc}, {elapsed:.0f}s). Last errors:{os.linesep}{_reason(out)}{_log_note(log_file)}'
 
 
 @mcp.tool(structured_output=False)
@@ -440,8 +450,9 @@ def clean_project(project_dir: str, full: bool = False) -> str:
         rc, out, log_file, elapsed = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
         return f'✅ Project {action} OK in {elapsed:.0f}s'
-    else:
-        return f'❌ clean FAILED (exit {rc}, {elapsed:.0f}s). Last errors:{os.linesep}{_reason(out)}{_log_note(log_file)}'
+    if rc == -1:
+        return out + _log_note(log_file)
+    return f'❌ clean FAILED (exit {rc}, {elapsed:.0f}s). Last errors:{os.linesep}{_reason(out)}{_log_note(log_file)}'
 
 
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')  # ANSI escapes from colored ESP_LOG output - pure noise for the agent
@@ -956,7 +967,7 @@ def run_pytest(project_dir: str, test_path: str = 'pytest', target: str = '', po
     with _BUILD_LOCK:
         rc, out, log_file, elapsed = _run_sync(cmd, project_dir, timeout=timeout)
     if rc == 0:
-        return f'✅ Tests passed in {elapsed:.0f}s ({len(out)} bytes output):{os.linesep}{_tail(out, 4000)}'
+        return f'✅ Tests passed in {elapsed:.0f}s:{os.linesep}{_tail(out, 800)}'
     return (f'❌ Tests FAILED / errored (exit {rc}, {elapsed:.0f}s). Last errors:{os.linesep}'
             f'{_reason(out, 10)}{_log_note(log_file)}')
 

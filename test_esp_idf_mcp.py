@@ -88,12 +88,14 @@ assert not (after - before), after - before  # the transient temp log left nothi
 _tdir = _tempfile.mkdtemp()
 _tbefore = set(os.listdir(m._LOG_DIR)) if os.path.isdir(m._LOG_DIR) else set()
 rc, out, tlf, el = m._run_sync(['cmd', '/c', 'ping', '-n', '5', '127.0.0.1'], _tdir, timeout=1)
-assert rc == -1 and 'Timed out' in out and tlf is None and el >= 1, (rc, out[:200], tlf)
+assert rc == -1 and 'TIMED OUT' in out and tlf is None and el >= 1, (rc, out[:200], tlf)
 _tafter = set(os.listdir(m._LOG_DIR)) if os.path.isdir(m._LOG_DIR) else set()
 assert not (_tafter - _tbefore), _tafter - _tbefore
 
 # verdict helpers: tail snaps to line start; reason extracts error-looking lines
 assert m._tail('A' * 60 + '\n' + 'B' * 50, 70) == 'B' * 50
+assert m._tail('A' * 100, 10) == 'A' * 10  # no newline: plain cut
+assert m._tail('hello world\n', 5) == 'orld\n'  # trailing newline would snap to empty - keep the unaligned tail
 _r = m._reason('step1 ok\nerror: boom\nninja: build stopped: subcommand failed.')
 assert 'error: boom' in _r and 'ninja' in _r and 'step1' not in _r
 rc, out, xlf, el = m._run_sync([sys.executable, '-c', "print('error: boom'); raise SystemExit(2)"], _tempfile.mkdtemp(), timeout=30)

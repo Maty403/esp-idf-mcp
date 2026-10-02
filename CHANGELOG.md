@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.0.0 (2026-10-02)
+
+The tool result format is now part of the contract - hence the major bump.
+
+- **Uniform ✅/❌ verdicts across all tools** — every call answers with an explicit verdict and elapsed time: `✅ Build OK in 87s.` / `❌ Build FAILED (exit 2, 8s). Last errors: …`. No more parsing prose to figure out whether a call succeeded.
+- **Failure reasons are extracted, not truncated** — on failure the server scans the full output for error-looking lines (`error` / `failed` / `fatal` / `exception` / `traceback` / `assert`) and returns the last ones (5, or 10 for pytest). idf.py and ninja print the real cause well before the end of the log, so a raw tail usually missed it. Timeouts show the same extracted "where it was stuck" lines.
+- **Line-aligned tails** — truncated output snaps forward to the next line start; the `x10000`-style half-token artifacts are gone.
+- **Breaking:** `build_project` no longer takes `full_log` — the one-line verdict plus the persistent `<project>/.esp_build.log` (rewritten every run) cover both needs; read the file when the full picture matters.
+- **Conciser successes** — `flash_project` no longer appends esptool's output tail (everything is in `.esp_flash.log`), pytest success shows an 800-byte summary tail instead of 4000.
+
 ## v0.7.2 (2026-09-29)
 
 - **Build and flash logs live in the project** — every `build_project` run writes `<project_dir>/.esp_build.log`, every `flash_project` run `<project_dir>/.esp_flash.log`; both are rewritten from scratch each time and their paths are stated in the tool docs, so the agent can read the complete output directly. Previously both landed in the MCP temp dir — where a lexicographic pruning bug evicted every tool log in favor of ancient monitor logs (observed in the wild: zero tool logs left, week-old monitor logs kept), which is why build logs were effectively unfindable.
