@@ -938,7 +938,7 @@ def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = Non
         open_on_port = [s for s, sess in _MONITORS.items() if sess.port.upper() == port.strip().upper()]
         if open_on_port:
             return (f'{port} is already monitored as {", ".join(open_on_port)} — monitor_close it '
-                    f'first if you want to reopen with a different baud.')
+                    f'first if you want to reopen.')
         sess = None
         try:
             sess = SerialSession(port, rate, log_path=log_path)

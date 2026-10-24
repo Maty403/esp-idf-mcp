@@ -116,6 +116,13 @@ try:
 finally:
     m._resolve_console_baud = _orig_resolve
 assert 'Invalid baud' in m.monitor_open('COMTEST', baud=-1)
+_calls = []
+m._resolve_console_baud = lambda pd: (_calls.append(1), 115200)[1]  # default baud=0 must consult detection exactly once
+try:
+    m.monitor_open('COMTEST', project_dir=_sd)
+    assert _calls == [1], _calls
+finally:
+    m._resolve_console_baud = _orig_resolve
 
 sess.stop()  # never-started session (no thread, no port) must stop cleanly
 
