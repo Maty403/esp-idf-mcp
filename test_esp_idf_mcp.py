@@ -101,6 +101,22 @@ assert 'error: boom' in _r and 'ninja' in _r and 'step1' not in _r
 rc, out, xlf, el = m._run_sync([sys.executable, '-c', "print('error: boom'); raise SystemExit(2)"], _tempfile.mkdtemp(), timeout=30)
 assert rc == 2 and el >= 0 and 'boom' in m._reason(out), (rc, out, el)
 
+# monitor_open baud parameter: explicit baud skips sdkconfig auto-detection entirely
+_sd = _tempfile.mkdtemp()
+with open(os.path.join(_sd, 'sdkconfig'), 'w') as f:
+    f.write('CONFIG_ESP_CONSOLE_UART_BAUDRATE=74880\n')
+assert m._resolve_console_baud(_sd) == 74880
+_orig_resolve = m._resolve_console_baud
+def _must_not_run(pd):
+    raise AssertionError('auto-detection must be skipped when baud is explicit')
+m._resolve_console_baud = _must_not_run
+try:
+    _r = m.monitor_open('COMTEST', baud=9600, project_dir=_sd)  # port does not exist -> open fails, but detection was never consulted
+    assert 'Failed to open COMTEST' in _r, _r
+finally:
+    m._resolve_console_baud = _orig_resolve
+assert 'Invalid baud' in m.monitor_open('COMTEST', baud=-1)
+
 sess.stop()  # never-started session (no thread, no port) must stop cleanly
 
 # build/flash expose a caller-tunable timeout that reaches _run_sync

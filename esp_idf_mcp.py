@@ -910,16 +910,22 @@ def _idle_watchdog(sess, sid, idle_release):
 
 @mcp.tool(structured_output=False)
 def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = None,
-                 idle_release: float = _SESSION_IDLE_RELEASE) -> str:
+                 idle_release: float = _SESSION_IDLE_RELEASE, baud: int = 0) -> str:
     """Open a persistent serial monitor session. Returns immediately (non-blocking).
     Args:
         port: Serial port (e.g. COM14)
         reset: Hard-reset the board after opening, so the session captures a fresh boot (default True)
         project_dir: Project dir for baud auto-detect (sdkconfig); the session full log goes to its .esp_monitor_full.log (rewritten fresh on every session open; standalone opens without a project dir keep no full-log file)
         idle_release: Seconds without monitor_read/monitor_send before the session auto-releases the port (default 120). Reopen if a call reports "No session".
+        baud: Explicit baud rate (e.g. 74880) - used as-is, the sdkconfig auto-detection is skipped. 0 (default) = auto-detect from the project sdkconfig (fallback 115200).
     """
-    baud = _resolve_console_baud(project_dir)
-    sid = f'{port}@{baud}'
+    if baud < 0:
+        return f'❌ Invalid baud rate: {baud}.'
+    if baud > 0:
+        rate = baud  # explicit - no sdkconfig lookup
+    else:
+        rate = _resolve_console_baud(project_dir)
+    sid = f'{port}@{rate}'
     # Session full log: into the project root when a project dir is given (.esp_monitor_full.log, easy to find);
     # standalone opens (no project) keep no full-log file - the ring buffer is all they have
     if project_dir:
@@ -935,7 +941,7 @@ def monitor_open(port: str, reset: bool = True, project_dir: Optional[str] = Non
                     f'first if you want to reopen with a different baud.')
         sess = None
         try:
-            sess = SerialSession(port, baud, log_path=log_path)
+            sess = SerialSession(port, rate, log_path=log_path)
             sess.start(reset=reset)
         except serial.SerialException as e:
             if sess:
