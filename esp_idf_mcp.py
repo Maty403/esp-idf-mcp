@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import tempfile
 import subprocess
 import sys
@@ -107,12 +108,28 @@ print(f'[esp-idf-mcp] IDF_PATH={IDF_PATH}  TOOLS={_tools}  PYENV={_python_env}',
 
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP('ESP-IDF')
+mcp = FastMCP('ESP-IDF', instructions=(
+    'ESP-IDF working rules: sdkconfig is generated - never hand-edit it (kconfgen overwrites); '
+    'config changes = write sdkconfig.defaults + sync the live sdkconfig, then build. '
+    'Writing or reviewing C for ESP-IDF: check every esp_err_t/API return value (no unchecked init/deinit); '
+    'ISR context: no heap, no printf, no mutexes, ISR-safe APIs only, keep ISRs short; '
+    'shared task state behind mutexes (priority inheritance), no busy-waiting; '
+    'DMA buffers in DMA-capable memory, sized to the peripheral; flash: erase before write, handle nvs_commit errors; '
+    'no blocking calls in time-critical tasks, keep the watchdog fed. '
+    'Verify uncertain API facts against the official docs before flagging.'
+))
 
 
 def _get_idf_py():
     """Get the path to idf.py"""
     return os.path.join(os.environ['IDF_PATH'], 'tools', 'idf.py')
+
+
+def _idf_cmd(*args):
+    """idf.py command prefix. '--preview' rides on every invocation: idf.py hard-rejects preview chips
+    (esp32s31 etc., PREVIEW_TARGETS in tools/idf_py_actions/constants.py) without it, and for stable
+    targets the flag is a no-op - so all idf.py-based tools work on both unconditionally."""
+    return [IDF_PYTHON, _get_idf_py(), '--preview', *args]
 
 
 ### Tool logs: build/flash write into the project (.esp_build.log / .esp_flash.log, rewritten every run);
@@ -163,6 +180,11 @@ def _run_sync(cmd, cwd, timeout=600, log_file=None):
             print(f'Running: {" ".join(cmd)} in {cwd}', file=sys.stderr)
             env = os.environ.copy()
             env['PYTHONUTF8'] = '1'  # redirected child stdout uses the locale encoding (cp936 on zh-CN Windows); this log is read back as utf-8 below
+            if os.name == 'nt':
+                # idf.py treats MSYSTEM (Git Bash) as unsupported: it prints a warning and then falls
+                # through its elif chain WITHOUT calling main() - every command exits 0 having done
+                # nothing. A server started from Git Bash would otherwise idle-loop all idf.py tools.
+                env.pop('MSYSTEM', None)
             proc = subprocess.Popen(
                 cmd, stdout=f, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
@@ -229,8 +251,8 @@ def build_project(project_dir: str, timeout: int = 600) -> str:
         timeout: Max seconds for the whole build (default 600). On timeout the process tree is killed and a failure returned.
     """
     with _BUILD_LOCK:
-        rc, out, log_file, elapsed = _run_sync([IDF_PYTHON, _get_idf_py(), '-C', project_dir, 'build'], project_dir, timeout=timeout,
-                                               log_file=os.path.join(project_dir, '.esp_build.log'))
+        rc, out, log_file, elapsed = _run_sync(_idf_cmd('-C', project_dir, 'build'), project_dir, timeout=timeout,
+                                           log_file=os.path.join(project_dir, '.esp_build.log'))
         if rc == 0:
             return f'✅ Build OK in {elapsed:.0f}s.\n' + _tail(out)
         if rc == -1:
@@ -239,14 +261,35 @@ def build_project(project_dir: str, timeout: int = 600) -> str:
                 f'{_reason(out)}{_log_note(log_file)}')
 
 
-def _esptool_flash_cmd(port):
+# Chips whose RAM stub flasher doesn't ship (yet): the idf-generated flash command carries --no-stub
+# for them, and esptool fails trying to load a stub that doesn't exist. Stub flash is faster, so this
+# stays a target allowlist rather than a blanket --no-stub.
+# ponytail: extend when IDF/esptool grow stubs for these chips (drop the entry) or ship new stub-less chips
+_NO_STUB_TARGETS = ('esp32s31',)
+
+
+def _project_target(project_dir):
+    """CONFIG_IDF_TARGET from the project's sdkconfig ('' if absent/unreadable)."""
+    try:
+        with open(os.path.join(project_dir, 'sdkconfig'), encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if line.startswith('CONFIG_IDF_TARGET='):
+                    return line.split('=', 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return ''
+
+
+def _esptool_flash_cmd(port, no_stub=False):
     """esptool command line for flashing. esptool 5.x (bundled since IDF v6.0; v5.5 still pins esptool~=4.12)
     renamed commands and option values to hyphenated spelling but keeps the underscore names as deprecated
-    aliases - so pre-v6 IDF venvs get the underscore forms, which work on every esptool version."""
+    aliases - so pre-v6 IDF venvs get the underscore forms, which work on every esptool version.
+    no_stub: skip the RAM stub loader (required for _NO_STUB_TARGETS chips like esp32s31)."""
     new = tuple(int(x) for x in re.findall(r'\d+', os.environ['ESP_IDF_VERSION'])[:2]) >= (6, 0)
     return [IDF_PYTHON, '-m', 'esptool', '--port', port,
             '--before', 'default-reset' if new else 'default_reset',
             '--after', 'hard-reset' if new else 'hard_reset',
+            *(['--no-stub' if new else '--no_stub'] if no_stub else []),
             'write-flash' if new else 'write_flash']
 
 
@@ -269,7 +312,7 @@ def flash_project(project_dir: str, port: Optional[str] = None, monitor: bool = 
     closed_note = f' (auto-closed monitor: {", ".join(closed)})' if closed else ''
     build_dir = os.path.join(project_dir, 'build')
     flash_args_file = os.path.join(build_dir, 'flash_args')
-    cmd = _esptool_flash_cmd(port)
+    cmd = _esptool_flash_cmd(port, no_stub=_project_target(project_dir) in _NO_STUB_TARGETS)
     if os.path.exists(flash_args_file):
         with open(flash_args_file, 'r', encoding='utf-8') as f:
             cmd.extend(shlex.split(f.read()))  # same POSIX shlex tokens esptool's @flash_args expansion produces
@@ -383,9 +426,9 @@ def set_target(project_dir: str, target: str) -> str:
     for the new target, so target-specific settings are not carried over.
     Args:
         project_dir: Absolute path to the ESP-IDF project directory
-        target: Target chip (e.g. esp32, esp32s3, esp32c2)
+        target: Target chip (e.g. esp32, esp32s3, esp32c2, esp32s31)
     """
-    cmd = [IDF_PYTHON, _get_idf_py(), 'set-target', target]
+    cmd = _idf_cmd('set-target', target)
     with _BUILD_LOCK:
         rc, out, log_file, elapsed = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
@@ -406,7 +449,7 @@ def add_dependency(project_dir: str, dependency: str, component: str = 'main', p
         component: Name of the component in the project whose manifest gets the dependency (default 'main').
         path: Path to the component directory whose manifest gets the dependency. Takes precedence over `component` if set (official --path option).
     """
-    cmd = [IDF_PYTHON, _get_idf_py(), 'add-dependency', dependency]
+    cmd = _idf_cmd('add-dependency', dependency)
     if path:
         cmd.extend(['--path', path])
     elif component != 'main':
@@ -427,7 +470,7 @@ def remove_dependency(project_dir: str, dependency: str) -> str:
         project_dir: Absolute path to the ESP-IDF project directory
         dependency: Component dependency name (e.g. 'espressif/button', 'button')
     """
-    cmd = [IDF_PYTHON, _get_idf_py(), 'remove-dependency', dependency]
+    cmd = _idf_cmd('remove-dependency', dependency)
     with _BUILD_LOCK:
         rc, out, log_file, elapsed = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:
@@ -438,6 +481,100 @@ def remove_dependency(project_dir: str, dependency: str) -> str:
 
 
 @mcp.tool(structured_output=False)
+def list_examples(category: str = '') -> str:
+    """List official ESP-IDF examples bundled with the installed IDF (browse before create_project).
+    Args:
+        category: Optional category (e.g. 'get-started', 'wifi', 'peripherals'). Empty = list categories only.
+    """
+    root = os.path.join(IDF_PATH, 'examples')
+    if not os.path.isdir(root):
+        return f'No examples directory under {IDF_PATH}'
+    if not category:
+        cats = sorted(d for d in os.listdir(root)
+                      if os.path.isdir(os.path.join(root, d)) and not d.startswith(('.', '_')))
+        return (f'{len(cats)} example categories (pass one as list_examples(category)):\n'
+                + '\n'.join(f'  {c}' for c in cats))
+    cat_dir = os.path.join(root, *category.strip('/\\').split('/'))
+    if not os.path.isdir(cat_dir):
+        return f'❌ No such category: {category}. Call list_examples() without arguments for the list.'
+    found = []
+    for dirpath, dirnames, filenames in os.walk(cat_dir):
+        if 'CMakeLists.txt' in filenames:  # an example root - do not descend into main/components
+            found.append(os.path.relpath(dirpath, root).replace(os.sep, '/'))
+            dirnames.clear()
+            continue
+        dirnames[:] = [d for d in dirnames if not d.startswith(('.', '_'))]
+    if not found:
+        return f'No examples found under {category}.'
+    return (f'{len(found)} examples in {category} (pass one to create_project(example=...)):\n'
+            + '\n'.join(f'  {e}' for e in sorted(found)))
+
+
+def _rename_project_cmake(project_dir, name):
+    """Point a copied example's project() at the new directory name. Returns the number of renames
+    (0 = nothing to rename - the copied dir may not be a buildable example). Never raises."""
+    try:
+        cmake = os.path.join(project_dir, 'CMakeLists.txt')
+        with open(cmake, 'r', encoding='utf-8') as f:
+            text = f.read()
+    except (OSError, ValueError):
+        return 0
+    new, n = re.subn(r'(?m)^(project\()\s*[A-Za-z0-9_.+-]+', lambda m: m.group(1) + name, text, count=1)
+    if n:
+        try:
+            with open(cmake, 'w', encoding='utf-8') as f:
+                f.write(new)
+        except OSError:
+            return 0
+    return n
+
+
+@mcp.tool(structured_output=False)
+def create_project(path: str, example: str = '') -> str:
+    """Create a new ESP-IDF project directory, optionally from an official example bundled with the installed IDF (browse with list_examples).
+    Args:
+        path: Absolute path for the new project directory (must not exist or be empty)
+        example: Optional official example relative to the IDF examples root (e.g. 'get-started/hello_world'). Empty = minimal template project. To pull registry components into the new project, call add_dependency afterwards.
+    """
+    path = os.path.abspath(path)
+    if os.path.isdir(path) and os.listdir(path):
+        return f'❌ Refusing to create: {path} already exists and is not empty.'
+    if not os.path.basename(path):
+        return '❌ Invalid project path (no directory name).'
+    parent = os.path.dirname(path)
+    if not os.path.isdir(parent):
+        return f'❌ Parent directory does not exist: {parent}'
+    next_steps = 'Next: set_target(project_dir=...) → build_project → flash_project.'
+    if example:
+        example = example.strip('/\\').replace('\\', '/')
+        examples_root = os.path.realpath(os.path.join(IDF_PATH, 'examples'))
+        src = os.path.realpath(os.path.join(examples_root, *example.split('/')))
+        # containment check: '..' must not escape the examples tree; the target must not sit inside the source (copytree would recurse forever)
+        if not src.startswith(examples_root + os.sep) \
+                or not os.path.isfile(os.path.join(src, 'CMakeLists.txt')) \
+                or os.path.realpath(path).startswith(src + os.sep):
+            return (f'❌ No such example: {example} (looked at {src}). '
+                    f"Call list_examples(category) to browse the installed IDF's examples.")
+        t0 = time.monotonic()
+        try:
+            shutil.copytree(src, path, ignore=shutil.ignore_patterns('build', '__pycache__', '.git'), dirs_exist_ok=True)
+        except OSError as e:
+            return f'❌ Copying example failed: {e}'
+        renamed = _rename_project_cmake(path, os.path.basename(path))
+        note = '' if renamed else ' (no project() line in its CMakeLists - the copied dir may not be a buildable example)'
+        return f'✅ Project created at {path} from example {example} in {time.monotonic() - t0:.0f}s{note}. {next_steps}'
+    with _BUILD_LOCK:
+        # -C <parent> create-project <name> -> <parent>/<name> (the --path option proved unreliable)
+        rc, out, log_file, elapsed = _run_sync(_idf_cmd('-C', parent, 'create-project', os.path.basename(path)),
+                                               tempfile.gettempdir(), timeout=120)
+    if rc == 0:
+        return f'✅ Project created at {path} in {elapsed:.0f}s. {next_steps}'
+    if rc == -1:
+        return out + _log_note(log_file)
+    return f'❌ create-project FAILED (exit {rc}, {elapsed:.0f}s). Last errors:{os.linesep}{_reason(out)}{_log_note(log_file)}'
+
+
+@mcp.tool(structured_output=False)
 def clean_project(project_dir: str, full: bool = False) -> str:
     """Clean build artifacts using idf.py.
     Args:
@@ -445,7 +582,7 @@ def clean_project(project_dir: str, full: bool = False) -> str:
         full: If True, remove entire build directory (fullclean). If False, incremental clean.
     """
     action = 'fullclean' if full else 'clean'
-    cmd = [IDF_PYTHON, _get_idf_py(), action]
+    cmd = _idf_cmd(action)
     with _BUILD_LOCK:
         rc, out, log_file, elapsed = _run_sync(cmd, project_dir, timeout=120)
     if rc == 0:

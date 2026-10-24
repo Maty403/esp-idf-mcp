@@ -109,4 +109,52 @@ for name in ('build_project', 'flash_project'):
     sig = inspect.signature(getattr(m, name))
     assert sig.parameters['timeout'].default == 600, name
 
+# idf.py commands always carry --preview (esp32s31 is a PREVIEW_TARGET; the flag is a no-op for stable targets)
+cmd = m._idf_cmd('set-target', 'esp32s31')
+assert cmd[:2] == [m.IDF_PYTHON, m._get_idf_py()] and cmd[2] == '--preview' and cmd[3:] == ['set-target', 'esp32s31'], cmd
+
+# flash command can go stub-less for chips without a RAM stub flasher (esp32s31)
+_old = os.environ['ESP_IDF_VERSION']
+try:
+    os.environ['ESP_IDF_VERSION'] = '6.1'
+    cmd = m._esptool_flash_cmd('COM3', no_stub=True)
+    assert cmd[cmd.index('--no-stub') + 1] == 'write-flash', cmd
+    assert '--no-stub' not in m._esptool_flash_cmd('COM3'), cmd  # default keeps the stub (faster flash)
+    os.environ['ESP_IDF_VERSION'] = '5.5'  # pre-v6 esptool uses the underscore alias
+    cmd = m._esptool_flash_cmd('COM3', no_stub=True)
+    assert cmd[cmd.index('--no_stub') + 1] == 'write_flash', cmd
+finally:
+    os.environ['ESP_IDF_VERSION'] = _old
+
+# _project_target: CONFIG_IDF_TARGET from sdkconfig, '' when the file is absent
+_tdir = _tempfile.mkdtemp()
+assert m._project_target(_tdir) == ''
+with open(os.path.join(_tdir, 'sdkconfig'), 'w') as f:
+    f.write('CONFIG_IDF_TARGET="esp32s31"\n')
+assert m._project_target(_tdir) == 'esp32s31'
+
+# list_examples + create_project: browse and create from the bundled IDF examples
+assert 'get-started' in m.list_examples()
+assert 'get-started/hello_world' in m.list_examples('get-started')
+_cp = _tempfile.mkdtemp()
+_proj = os.path.join(_cp, 'myproj')
+_r = m.create_project(_proj, example='get-started/hello_world')
+assert _r.startswith('✅'), _r
+assert 'project(myproj)' in open(os.path.join(_proj, 'CMakeLists.txt'), encoding='utf-8').read()
+assert any(f.endswith('.c') for f in os.listdir(os.path.join(_proj, 'main')))
+assert m.create_project(_proj, example='get-started/hello_world').startswith('❌')  # non-empty target refused
+assert m.list_examples('no-such-cat').startswith('❌')
+assert m.create_project(os.path.join(_tempfile.mkdtemp(), 'x'), example='..').startswith('❌')  # traversal rejected, not the whole IDF tree
+_ed = os.path.join(_tempfile.mkdtemp(), 'ed')
+os.makedirs(_ed)
+assert m.create_project(_ed, example='get-started/hello_world').startswith('✅')  # existing empty dir is fine
+_tpl = os.path.join(_tempfile.mkdtemp(), 'tpl')
+_r2 = m.create_project(_tpl)
+assert _r2.startswith('✅'), _r2
+assert os.path.isfile(os.path.join(_tpl, 'CMakeLists.txt'))
+if os.name == 'nt':
+    rc, out, _, _ = m._run_sync([sys.executable, '-c', 'import os;print("MSYSTEM" in os.environ)'],
+                                _tempfile.mkdtemp(), timeout=30)
+    assert rc == 0 and 'False' in out, (rc, out)  # MSYSTEM stripped: idf.py silently no-ops under MSYS
+
 print('all checks passed')

@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.0 (2026-10-02)
+
+- **`create_project(path, example='')`** — start a new project in one call: a minimal template via `idf.py create-project`, or a copy of any official example bundled with the installed IDF (`example='get-started/hello_world'`; the root `project()` name is renamed to the new directory). Fully offline — for registry components, call `add_dependency` afterwards.
+- **`list_examples(category='')`** — browse what the installed IDF ships: categories without arguments, example paths (ready for `create_project`) within a category.
+- **idf.py under Git Bash fixed** — idf.py detects the `MSYSTEM` environment variable, prints a warning and then exits 0 **without running the command** (its MSYS branch never calls `main()`). The server now strips `MSYSTEM` from child-process environments on Windows, so a server started from Git Bash no longer silently no-ops every `idf.py` tool.
+
 ## v1.0.0 (2026-10-02)
 
 The tool result format is now part of the contract - hence the major bump.
