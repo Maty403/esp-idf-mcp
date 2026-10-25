@@ -27,12 +27,12 @@ Instead of an agent only being able to *write* firmware code, this server closes
    codex mcp list
    ```
 
-   If `esp-idf-mcp` is not on your PATH, open `%USERPROFILE%\\.codex\\config.toml` and add the following, replacing both paths. Use the same Python environment where you ran `pip install .`:
+   If `esp-idf-mcp` is not on your PATH, open `%USERPROFILE%\.codex\config.toml` and add the following, replacing both paths. Use the same Python environment where you ran `pip install .`:
 
    ```toml
    [mcp_servers.esp-idf]
-   command = "C:\\\\path\\\\to\\\\python.exe"
-   args = ["C:\\\\path\\\\to\\\\esp-idf-mcp\\\\esp_idf_mcp.py"]
+   command = "C:\\path\\to\\python.exe"
+   args = ["C:\\path\\to\\esp-idf-mcp\\esp_idf_mcp.py"]
    ```
 
 3. Restart Codex, open an ESP-IDF project, and ask: **“Build this ESP-IDF project.”** In the desktop app, check **Settings → MCP servers** or type `/mcp` to confirm the server is connected.
