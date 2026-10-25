@@ -6,6 +6,68 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that le
 
 Instead of an agent only being able to *write* firmware code, this server closes the loop: compile → flash over serial → capture boot logs → run `pytest-embedded` hardware tests — all without leaving the agent's tool set.
 
+<!-- mcp-name: io.github.Maty403/esp-idf-mcp -->
+
+## Quick start (Windows + Codex)
+
+**Requirements:** ESP-IDF, Python 3.9 or newer, and an MCP-capable Codex client. A connected board is needed only for flashing, serial monitoring, and hardware-in-the-loop tests.
+
+1. Clone this repository and install it into the Python environment Codex will use:
+
+   ```powershell
+   git clone https://github.com/Maty403/esp-idf-mcp.git
+   cd esp-idf-mcp
+   python -m pip install .
+   ```
+
+2. Add the server to Codex. The desktop app, CLI, and IDE extension share the MCP configuration. From a terminal, run:
+
+   ```powershell
+   codex mcp add esp-idf -- esp-idf-mcp
+   codex mcp list
+   ```
+
+   If `esp-idf-mcp` is not on your PATH, open `%USERPROFILE%\.codex\config.toml` and add the following, replacing both paths. Use the same Python environment where you ran `pip install .`:
+
+   ```toml
+   [mcp_servers.esp-idf]
+   command = "C:\\path\\to\\python.exe"
+   args = ["C:\\path\\to\\esp-idf-mcp\\esp_idf_mcp.py"]
+   ```
+
+3. Restart Codex, open an ESP-IDF project, and ask: **“Build this ESP-IDF project.”** In the desktop app, check **Settings → MCP servers** or type `/mcp` to confirm the server is connected.
+
+### Demo workflow
+
+With an ESP-IDF project open and a board connected, try:
+
+1. “Read the connected chip info and list the serial devices.”
+2. “Build this project.”
+3. “Flash this project to COM3, then monitor the boot log and summarize the application output.”
+
+Replace `COM3` with the correct port shown on your machine. Confirm the target board and port before flashing.
+
+
+
+## Where this server fits
+
+A community-built local MCP server for ESP-IDF hardware workflows. Use it to let an AI agent build firmware, interact with serial-connected boards, and run hardware-in-the-loop tests from the same workflow.
+
+### Feature comparison
+
+Compared with Espressif's [built-in ESP-IDF Tools MCP server](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/tools/idf-py.html#esp-idf-mcp-server) (documentation checked 2026-10-26):
+
+| Workflow | Built-in ESP-IDF Tools MCP | esp-idf-mcp |
+| --- | --- | --- |
+| Set target, build, flash, clean | Yes | Yes |
+| Create a project | Sample template | Minimal template or bundled ESP-IDF example |
+| Monitor a device | Wait for expected output; full serial log is saved | Persistent read/send/close sessions, incremental and full-log views, baud-rate detection, and USB reconnect handling |
+| Project and device context | Project config, build status, connected-device resources | Connected-device resource plus chip model, revision, crystal, MAC, and flash details |
+| Components and hardware tests | Not listed in the built-in Tools MCP tool set | Browse bundled examples, add/remove component dependencies, and run `pytest-embedded` hardware tests |
+
+This table compares the **local Tools MCP server** with this project. Espressif's separate Documentation MCP and Component Registry MCP servers provide documentation and component discovery; they can complement either local tools server.
+
+
 ## Features
 
 - **Zero-config ESP-IDF discovery** — IDF root, tools directory and the Python venv are located automatically (env var first, else the newest install under `D:\esp`, `C:\esp` or `~/esp`); toolchain paths are matched by version glob, so upgrading ESP-IDF or a toolchain never requires editing the script.
