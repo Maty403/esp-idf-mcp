@@ -6,6 +6,26 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that le
 
 Instead of an agent only being able to *write* firmware code, this server closes the loop: compile → flash over serial → capture boot logs → run `pytest-embedded` hardware tests — all without leaving the agent's tool set.
 
+
+## Where this server fits
+
+A community-built local MCP server for ESP-IDF hardware workflows. Use it to let an AI agent build firmware, interact with serial-connected boards, and run hardware-in-the-loop tests from the same workflow.
+
+### Feature comparison
+
+Compared with Espressif's [built-in ESP-IDF Tools MCP server](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/tools/idf-py.html#esp-idf-mcp-server) (documentation checked 2026-10-26):
+
+| Workflow | Built-in ESP-IDF Tools MCP | esp-idf-mcp |
+| --- | --- | --- |
+| Set target, build, flash, clean | Yes | Yes |
+| Create a project | Sample template | Minimal template or bundled ESP-IDF example |
+| Monitor a device | Wait for expected output; full serial log is saved | Persistent read/send/close sessions, incremental and full-log views, baud-rate detection, and USB reconnect handling |
+| Project and device context | Project config, build status, connected-device resources | Connected-device resource plus chip model, revision, crystal, MAC, and flash details |
+| Components and hardware tests | Not listed in the built-in Tools MCP tool set | Browse bundled examples, add/remove component dependencies, and run `pytest-embedded` hardware tests |
+
+This table compares the **local Tools MCP server** with this project. Espressif's separate Documentation MCP and Component Registry MCP servers provide documentation and component discovery; they can complement either local tools server.
+
+
 ## Features
 
 - **Zero-config ESP-IDF discovery** — IDF root, tools directory and the Python venv are located automatically (env var first, else the newest install under `D:\esp`, `C:\esp` or `~/esp`); toolchain paths are matched by version glob, so upgrading ESP-IDF or a toolchain never requires editing the script.
