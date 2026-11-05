@@ -781,7 +781,8 @@ class SerialSession:
                 except Exception:
                     pass
                 # After a reset the port disappears and re-enumerates (USB-OTG); allow 0.5-2 s
-                # Reconnect logic modeled on idf_monitor: 0.5 s interval, up to 10 s
+                # Reconnect logic modeled on idf_monitor: 0.5 s interval; if the port is
+                # still gone after 5 s it is treated as physically lost and the session releases itself
                 reconnect_waited = 0
                 while self.running:
                     try:
@@ -800,9 +801,10 @@ class SerialSession:
                         print(f'[INFO] Port {self.port} reconnected after {reconnect_waited}s', file=sys.stderr)
                         break
                     except (serial.SerialException, OSError):
-                        if reconnect_waited >= 10:  # give up after 10 s
-                            self.error = f'Port re-enumeration failed after {reconnect_waited}s'
+                        if reconnect_waited >= 5:  # physically lost: release instead of zombie-ing in the registry
+                            self.error = f'Port lost for {reconnect_waited:.0f}s - session released, monitor_open to re-acquire'
                             self.running = False
+                            self._close_ser()  # cannot call stop() here: the reader would join itself; the watchdog finishes the release
                             return
                         continue
 
@@ -899,7 +901,15 @@ def _idle_watchdog(sess, sid, idle_release):
     while sess.running and time.monotonic() - sess.last_activity < idle_release:
         time.sleep(1)
     if not sess.running:
-        return  # closed externally (monitor_close / flash / atexit) while we slept
+        # Dead while still registered: the reader gave up on its own (port lost >5 s) - a
+        # dead session must not keep the id occupied, so finish the release here (this is
+        # a different thread, so stop()'s join is safe). External closes (monitor_close /
+        # flash / atexit) already popped the slot, the identity check skips those.
+        with _MONITORS_LOCK:
+            if _MONITORS.get(sid) is sess:
+                sess.stop()
+                _MONITORS.pop(sid, None)
+        return
     print(f'[INFO] {sid} idle >{idle_release}s, releasing {sess.port}', file=sys.stderr)
     with _MONITORS_LOCK:
         if _MONITORS.get(sid) is not sess:

@@ -69,6 +69,24 @@ s2.stop()
 content = open(_log, encoding='utf-8').read()
 assert 'old crash line' not in content and 'fresh line' in content, content
 
+# port lost >5 s: the reader gives up (running=False, port closed) and the watchdog releases
+# the registry slot, so monitor_open can re-acquire instead of hitting "already monitored"
+_dead = m.SerialSession('COMDEAD', 115200)
+_dead.running = False  # simulate the reader's 5 s give-up
+m._MONITORS['COMDEAD@115200'] = _dead
+m._idle_watchdog(_dead, 'COMDEAD@115200', 120)  # synchronous: loop exits at once, dead-session cleanup pops the slot
+assert 'COMDEAD@115200' not in m._MONITORS and not _dead.running
+# a replacement session under the same id is not ours to pop (closed and reopened while we slept)
+_old = m.SerialSession('COMREP', 115200)
+_new = m.SerialSession('COMREP', 115200)
+_old.running = False
+m._MONITORS['COMREP@115200'] = _new
+m._idle_watchdog(_old, 'COMREP@115200', 120)
+assert m._MONITORS.get('COMREP@115200') is _new  # untouched
+m._MONITORS.pop('COMREP@115200', None)
+_new.stop()
+_old.stop()
+
 # _run_sync: a given log_file is rewritten every run; without one the temp log is transient (deleted, returns None)
 _pdir = _tempfile.mkdtemp()
 _plog = os.path.join(_pdir, '.esp_build.log')
